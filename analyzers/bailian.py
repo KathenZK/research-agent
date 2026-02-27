@@ -65,8 +65,20 @@ class BailianAnalyzer:
             response.raise_for_status()
             result = response.json()
             
-            # 解析 AI 输出
-            content = result.get('output', {}).get('choices', [{}])[0].get('message', {}).get('content', '')
+            if DEBUG:
+                print(f"API Response: {json.dumps(result, indent=2)}")
+            
+            # 解析 AI 输出 - 百炼 API 格式
+            # 格式 1: output.choices[0].message.content
+            # 格式 2: output.text
+            content = ''
+            output = result.get('output', {})
+            if 'choices' in output:
+                content = output.get('choices', [{}])[0].get('message', {}).get('content', '')
+            elif 'text' in output:
+                content = output.get('text', '')
+            elif 'content' in output:
+                content = output.get('content', '')
             
             if DEBUG:
                 print(f"AI Response: {content}")
