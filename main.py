@@ -146,16 +146,33 @@ def send_to_feishu(opportunities: List[Opportunity]):
 
 def print_results(opportunities: List[Opportunity]):
     """打印结果"""
-    print("\n" + "="*60)
+    print("\n" + "="*80)
     print(f"发现 {len(opportunities)} 个产品机会")
-    print("="*60 + "\n")
+    print("="*80 + "\n")
     
     for i, opp in enumerate(opportunities[:5], 1):  # 只显示 top 5
-        print(f"#{i} [{opp.source.upper()}] 评分：{opp.score}")
+        print(f"#{i} [{opp.source.upper()}] 评分：{opp.score}/100")
         print(f"   标题：{opp.title}")
-        print(f"   摘要：{opp.summary[:100]}...")
-        print(f"   建议：{opp.suggestion[:80]}...")
+        print(f"   链接：{opp.url}")
         print()
+        print(f"   📖 项目介绍")
+        print(f"   {opp.description[:200]}...")
+        print()
+        print(f"   💰 盈利模式")
+        print(f"   {opp.business_model[:150] if opp.business_model else '待分析'}...")
+        print()
+        print(f"   🏆 竞争对手")
+        print(f"   {opp.competitors[:150] if opp.competitors else '待分析'}...")
+        print()
+        print(f"   💡 建议方向")
+        print(f"   {opp.suggestion[:150]}...")
+        print()
+        print(f"   🔗 相关链接")
+        print(f"   - 原始链接：{opp.source_url}")
+        for link in opp.research_links[1:3]:  # 显示研究链接
+            print(f"   - {link}")
+        print()
+        print("-"*80 + "\n")
 
 
 def main():

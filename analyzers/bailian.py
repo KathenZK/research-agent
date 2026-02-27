@@ -120,6 +120,15 @@ class BailianAnalyzer:
                 summary=analysis.get('summary', ''),
                 suggestion=analysis.get('suggestion', ''),
                 tags=analysis.get('tags', []),
+                description=analysis.get('description', ''),
+                business_model=analysis.get('business_model', ''),
+                competitors=analysis.get('competitors', ''),
+                source_url=item.get('url', ''),  # 原始链接
+                research_links=[
+                    item.get('url', ''),
+                    f"https://www.google.com/search?q={item.get('title', '')}",
+                    f"https://www.google.com/search?q={item.get('title', '')}+competitors+alternatives"
+                ],
                 created_at=datetime.now()
             )
             
@@ -142,18 +151,21 @@ class BailianAnalyzer:
 {f"热度：{item.get('score', 0)} 分" if item.get('score') else ""}
 {f"评论：{item.get('descendants', 0)} 条" if item.get('descendants') is not None else ""}
 
-请评估这是一个多好的产品机会（0-100 分），并给出分析。
+请详细分析这个产品机会，输出以下内容：
 
 输出严格的 JSON 格式：
 {{
     "score": 75,
-    "summary": "200 字以内的摘要，说明这是什么、解决了什么问题",
-    "suggestion": "100 字以内的可落地产品建议",
+    "summary": "50 字一句话总结",
+    "description": "200 字详细介绍：这个项目是做什么的？解决什么问题？目标用户是谁？",
+    "business_model": "150 字盈利模式：如何赚钱？订阅制？一次性付费？广告？佣金？",
+    "competitors": "150 字竞争对手：市场上有哪些类似产品？它们的优缺点？",
+    "suggestion": "150 字可落地建议：如果要复制/改进这个项目，具体怎么做？",
     "tags": ["AI", "SaaS", "B2B"]
 }}
 
 评分标准：
-- 90-100: 明确的痛点 + 付费意愿强 + 竞争少
+- 90-100: 明确的痛点 + 付费意愿强 + 竞争少 + 市场大
 - 70-89: 有需求 + 有市场 + 可差异化
 - 50-69: 一般机会，需要验证
 - 0-49: 不建议做
