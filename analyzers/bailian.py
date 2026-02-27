@@ -140,9 +140,9 @@ class BailianAnalyzer:
             return None
     
     def _build_prompt(self, item: Dict[str, Any]) -> str:
-        """构建分析提示词"""
+        """构建分析提示词（投资尽调格式）"""
         return f"""
-分析这个产品/新闻机会：
+你是一级市场战略投资总监，请分析这个产品/新闻机会：
 
 标题：{item.get('title', '')}
 来源：{item.get('source', 'unknown').upper()}
@@ -151,24 +151,27 @@ class BailianAnalyzer:
 {f"热度：{item.get('score', 0)} 分" if item.get('score') else ""}
 {f"评论：{item.get('descendants', 0)} 条" if item.get('descendants') is not None else ""}
 
-请详细分析这个产品机会，输出以下内容：
+请按照投资尽调框架详细分析：
 
 输出严格的 JSON 格式：
 {{
     "score": 75,
     "summary": "50 字一句话总结",
-    "description": "200 字详细介绍：这个项目是做什么的？解决什么问题？目标用户是谁？",
-    "business_model": "150 字盈利模式：如何赚钱？订阅制？一次性付费？广告？佣金？",
-    "competitors": "150 字竞争对手：市场上有哪些类似产品？它们的优缺点？",
-    "suggestion": "150 字可落地建议：如果要复制/改进这个项目，具体怎么做？",
-    "tags": ["AI", "SaaS", "B2B"]
+    "description": "200 字项目介绍：做什么、解决什么问题、目标用户",
+    "market_size": "150 字 TAM/SAM/SOM 分析：总体市场/可服务市场/可获得市场",
+    "business_model": "150 字盈利模式：如何赚钱、定价策略、LTV/CAC",
+    "competitors": "150 字竞争格局：直接竞品、间接竞品、竞争优势",
+    "barriers": "100 字进入壁垒：技术/资金/监管/网络效应壁垒",
+    "risks": "150 字风险评估：市场风险、技术风险、团队风险、监管风险",
+    "suggestion": "150 字投资建议：跟投/领投/观望，理由和估值建议",
+    "tags": ["AI", "SaaS", "B2B", "A 轮"]
 }}
 
 评分标准：
-- 90-100: 明确的痛点 + 付费意愿强 + 竞争少 + 市场大
-- 70-89: 有需求 + 有市场 + 可差异化
-- 50-69: 一般机会，需要验证
-- 0-49: 不建议做
+- 90-100: 明确痛点 + 付费意愿强 + 竞争少 + 市场大 (>$10B) → 立即跟进
+- 70-89: 有需求 + 有市场 + 可差异化 → 深入研究
+- 50-69: 一般机会，需要验证 → 保持关注
+- 0-49: 不建议做 → 跳过
 """
     
     def _parse_json(self, content: str) -> Optional[Dict]:

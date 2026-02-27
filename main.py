@@ -22,7 +22,7 @@ from typing import List
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import DEBUG, DATA_DIR, LOG_DIR, BAILIAN_API_KEY, FEISHU_USER_ID, validate_config
-from collectors import HNCollector, PHCollector
+from collectors import HNCollector, PHCollector, TwitterCollector, ChineseMediaCollector, CrunchbaseCollector
 from analyzers import BailianAnalyzer
 from models import Opportunity
 
@@ -45,7 +45,8 @@ def setup_logging():
     return loglib.getLogger(__name__)
 
 
-def collect_data(hn_limit: int = 30, ph_limit: int = 20) -> List[dict]:
+def collect_data(hn_limit: int = 10, ph_limit: int = 5, twitter_limit: int = 20, 
+                 media_hours: int = 48, crunchbase_limit: int = 10) -> List[dict]:
     """收集数据"""
     import logging
     logger = logging.getLogger(__name__)
@@ -63,6 +64,24 @@ def collect_data(hn_limit: int = 30, ph_limit: int = 20) -> List[dict]:
     ph_items = PHCollector.fetch(limit=ph_limit)
     logger.info(f"Got {len(ph_items)} PH items")
     items.extend(ph_items)
+    
+    # Twitter/X
+    logger.info(f"Fetching Twitter (limit={twitter_limit})...")
+    twitter_items = TwitterCollector.fetch(limit=twitter_limit)
+    logger.info(f"Got {len(twitter_items)} Twitter items")
+    items.extend(twitter_items)
+    
+    # Chinese Media (36Kr, Huxiu, etc.)
+    logger.info(f"Fetching Chinese Media (hours={media_hours})...")
+    media_items = ChineseMediaCollector.fetch(hours=media_hours, limit=20)
+    logger.info(f"Got {len(media_items)} Chinese media items")
+    items.extend(media_items)
+    
+    # Crunchbase (funding data)
+    logger.info(f"Fetching Crunchbase (limit={crunchbase_limit})...")
+    crunchbase_items = CrunchbaseCollector.fetch(limit=crunchbase_limit)
+    logger.info(f"Got {len(crunchbase_items)} Crunchbase items")
+    items.extend(crunchbase_items)
     
     return items
 
@@ -156,15 +175,24 @@ def print_results(opportunities: List[Opportunity]):
         print(f"   链接：{opp.url}")
         print()
         print(f"   📖 项目介绍")
-        print(f"   {opp.description[:200]}...")
+        print(f"   {opp.description[:200] if opp.description else opp.summary[:200]}...")
+        print()
+        print(f"   📊 市场规模")
+        print(f"   {opp.market_size[:150] if opp.market_size else '待分析'}...")
         print()
         print(f"   💰 盈利模式")
         print(f"   {opp.business_model[:150] if opp.business_model else '待分析'}...")
         print()
-        print(f"   🏆 竞争对手")
+        print(f"   🏆 竞争格局")
         print(f"   {opp.competitors[:150] if opp.competitors else '待分析'}...")
         print()
-        print(f"   💡 建议方向")
+        print(f"   🚧 进入壁垒")
+        print(f"   {opp.barriers[:150] if opp.barriers else '待分析'}...")
+        print()
+        print(f"   ⚠️ 风险评估")
+        print(f"   {opp.risks[:150] if opp.risks else '待分析'}...")
+        print()
+        print(f"   💡 投资建议")
         print(f"   {opp.suggestion[:150]}...")
         print()
         print(f"   🔗 相关链接")
