@@ -3,10 +3,11 @@
 
 import json
 import requests
+import time
 from typing import Dict, Any, Optional
 from datetime import datetime
 
-from config import BAILIAN_API_KEY, BAILIAN_MODEL, BAILIAN_ENDPOINT, DEBUG
+from config import BAILIAN_API_KEY, BAILIAN_MODEL, BAILIAN_ENDPOINT, DEBUG, BAILIAN_TIMEOUT
 from models.opportunity import Opportunity
 
 
@@ -23,7 +24,7 @@ class BailianAnalyzer:
     
     def analyze(self, item: Dict[str, Any]) -> Optional[Opportunity]:
         """
-        分析一个项目，生成机会评估
+        分析一个项目，生成机会评估（带重试机制）
         
         Args:
             item: 收集到的项目数据
@@ -31,54 +32,75 @@ class BailianAnalyzer:
         Returns:
             Opportunity 对象，如果分析失败返回 None
         """
+        max_retries = 3
+        base_delay = 2  # 秒
+        
         try:
-            prompt = self._build_prompt(item)
+            for attempt in range(max_retries):
+                try:
+                    prompt = self._build_prompt(item)
+                    
+                    response = requests.post(
+                        self.endpoint,
+                        headers={
+                            "Authorization": f"Bearer {self.api_key}",
+                            "Content-Type": "application/json"
+                        },
+                        json={
+                            "model": self.model,
+                            "messages": [
+                                {
+                                    "role": "user",
+                                    "content": "你是一个产品机会分析专家。分析技术新闻和产品，评估商业机会。输出严格的 JSON 格式。\n\n" + prompt
+                                }
+                            ],
+                            "max_tokens": 1000,
+                            "temperature": 0.7
+                        },
+                        timeout=BAILIAN_TIMEOUT
+                    )
+                    
+                    if response.status_code == 429:  # Rate limited
+                        delay = base_delay * (2 ** attempt)
+                        print(f"Rate limited, retrying in {delay}s...")
+                        time.sleep(delay)
+                        continue
+                    
+                    if response.status_code != 200:
+                        print(f"API Error: {response.status_code}")
+                        print(f"Response: {response.text[:500]}")
+                        return None
+                    
+                    result = response.json()
+                    break  # Success
+                    
+                except requests.exceptions.Timeout:
+                    if attempt < max_retries - 1:
+                        delay = base_delay * (2 ** attempt)
+                        print(f"Timeout, retrying in {delay}s...")
+                        time.sleep(delay)
+                    else:
+                        print(f"Timeout after {max_retries} attempts")
+                        return None
+                except requests.exceptions.RequestException as e:
+                    if attempt < max_retries - 1:
+                        delay = base_delay * (2 ** attempt)
+                        print(f"Request error: {e}, retrying in {delay}s...")
+                        time.sleep(delay)
+                    else:
+                        print(f"Request failed after {max_retries} attempts: {e}")
+                        return None
             
-            response = requests.post(
-                self.endpoint,
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": self.model,
-                    "input": {
-                        "messages": [
-                            {
-                                "role": "system",
-                                "content": "你是一个产品机会分析专家。分析技术新闻和产品，评估商业机会。输出严格的 JSON 格式。"
-                            },
-                            {
-                                "role": "user",
-                                "content": prompt
-                            }
-                        ]
-                    },
-                    "parameters": {
-                        "temperature": 0.7,
-                        "max_tokens": 1000
-                    }
-                },
-                timeout=30
-            )
-            
-            response.raise_for_status()
-            result = response.json()
-            
+            # 处理成功的响应
             if DEBUG:
                 print(f"API Response: {json.dumps(result, indent=2)}")
             
-            # 解析 AI 输出 - 百炼 API 格式
-            # 格式 1: output.choices[0].message.content
-            # 格式 2: output.text
+            # 解析 AI 输出 - Anthropic 兼容 API 格式
             content = ''
-            output = result.get('output', {})
-            if 'choices' in output:
-                content = output.get('choices', [{}])[0].get('message', {}).get('content', '')
-            elif 'text' in output:
-                content = output.get('text', '')
-            elif 'content' in output:
-                content = output.get('content', '')
+            if 'content' in result and isinstance(result['content'], list) and len(result['content']) > 0:
+                content = result['content'][0].get('text', '')
+            elif 'choices' in result:
+                content = result.get('choices', [{}])[0].get('message', {}).get('content', '')
             
             if DEBUG:
                 print(f"AI Response: {content}")

@@ -7,10 +7,25 @@ from dotenv import load_dotenv
 # 加载 .env 文件
 load_dotenv()
 
-# 阿里百炼配置
+# 阿里百炼配置（Coding Plan 专属）
 BAILIAN_API_KEY = os.getenv("BAILIAN_API_KEY", "")
-BAILIAN_MODEL = os.getenv("BAILIAN_MODEL", "qwen-plus")
-BAILIAN_ENDPOINT = "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation"
+BAILIAN_MODEL = os.getenv("BAILIAN_MODEL", "qwen3-coder-plus")
+BAILIAN_BASE_URL = os.getenv("BAILIAN_BASE_URL", "https://coding.dashscope.aliyuncs.com/apps/anthropic")
+BAILIAN_TIMEOUT = int(os.getenv("BAILIAN_TIMEOUT", "60"))  # 秒
+# Coding Plan 使用 Anthropic 兼容 API
+BAILIAN_ENDPOINT = f"{BAILIAN_BASE_URL}/v1/messages"
+
+# 配置验证
+def validate_config():
+    """验证必需的配置参数"""
+    errors = []
+    if not BAILIAN_API_KEY:
+        errors.append("BAILIAN_API_KEY is required")
+    if not BAILIAN_BASE_URL:
+        errors.append("BAILIAN_BASE_URL is required")
+    if errors:
+        raise ValueError("Configuration errors: " + ", ".join(errors))
+    return True
 
 # 飞书配置
 FEISHU_APP_ID = os.getenv("FEISHU_APP_ID", "")

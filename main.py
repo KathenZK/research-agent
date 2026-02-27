@@ -21,7 +21,7 @@ from typing import List
 # 添加项目路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import DEBUG, DATA_DIR, LOG_DIR, BAILIAN_API_KEY, FEISHU_USER_ID
+from config import DEBUG, DATA_DIR, LOG_DIR, BAILIAN_API_KEY, FEISHU_USER_ID, validate_config
 from collectors import HNCollector, PHCollector
 from analyzers import BailianAnalyzer
 from models import Opportunity
@@ -92,12 +92,30 @@ def save_results(opportunities: List[Opportunity]):
     # 保存 JSON
     json_file = os.path.join(DATA_DIR, f"opportunities_{timestamp}.json")
     with open(json_file, 'w', encoding='utf-8') as f:
-        json.dump([opp.to_dict() for opp in opportunities], f, ensure_ascii=False, indent=2)
+        try:
+            json.dump([opp.to_dict() for opp in opportunities], f, ensure_ascii=False, indent=2)
+        except (TypeError, ValueError) as e:
+            print(f"JSON serialization error: {e}")
+            # 尝试简化数据
+            simple_data = []
+            for opp in opportunities:
+                try:
+                    simple_data.append({
+                        'id': opp.id,
+                        'title': opp.title,
+                        'score': opp.score
+                    })
+                except Exception:
+                    continue
+            json.dump(simple_data, f, ensure_ascii=False, indent=2)
     
     # 保存最新结果
     latest_file = os.path.join(DATA_DIR, "latest.json")
-    with open(latest_file, 'w', encoding='utf-8') as f:
-        json.dump([opp.to_dict() for opp in opportunities], f, ensure_ascii=False, indent=2)
+    try:
+        with open(latest_file, 'w', encoding='utf-8') as f:
+            json.dump([opp.to_dict() for opp in opportunities], f, ensure_ascii=False, indent=2)
+    except (IOError, OSError) as e:
+        print(f"Error saving latest.json: {e}")
     
     print(f"Saved to {json_file}")
 
@@ -142,6 +160,14 @@ def print_results(opportunities: List[Opportunity]):
 
 def main():
     """主函数"""
+    # 验证配置
+    try:
+        validate_config()
+    except ValueError as e:
+        print(f"❌ 配置错误：{e}")
+        print("请检查 .env 文件配置")
+        sys.exit(1)
+    
     parser = argparse.ArgumentParser(description="调研 Agent - 发现产品机会")
     parser.add_argument('--test', action='store_true', help='测试模式')
     parser.add_argument('--debug', action='store_true', help='调试模式')

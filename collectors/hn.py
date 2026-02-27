@@ -2,6 +2,7 @@
 """Hacker News 收集器"""
 
 import requests
+import time
 from typing import List, Dict, Any
 from config import HN_API_URL
 
@@ -29,10 +30,14 @@ class HNCollector:
             response.raise_for_status()
             top_ids = response.json()[:limit]
             
-            # 获取文章详情
+            # 获取文章详情（带限流）
             items = []
-            for item_id in top_ids:
+            for i, item_id in enumerate(top_ids):
                 try:
+                    # 限流：每 10 个请求延迟 1 秒
+                    if i > 0 and i % 10 == 0:
+                        time.sleep(1)
+                    
                     item_response = requests.get(
                         f"{HN_API_URL}/item/{item_id}.json",
                         timeout=5
