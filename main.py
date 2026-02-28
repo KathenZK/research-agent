@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import DEBUG, DATA_DIR, LOG_DIR, BAILIAN_API_KEY, FEISHU_USER_ID, validate_config, GITHUB_TOKEN, GITHUB_REPO
 from collectors import HNCollector, PHCollector, TwitterCollector, ChineseMediaCollector, CrunchbaseCollector
 from collectors.indiehackers import IndieHackersCollector
+from collectors.reddit import RedditCollector
 from analyzers import BailianAnalyzer
 from models import Opportunity
 

@@ -3,11 +3,10 @@
 
 import requests
 from typing import List, Dict, Any
-import re
 
 
 class IndieHackersCollector:
-    """IndieHackers 产品/收入案例收集器（网页抓取）"""
+    """IndieHackers 产品/收入案例收集器（API + 备用）"""
     
     def fetch(self, limit: int = 20) -> List[Dict[str, Any]]:
         """
@@ -21,49 +20,64 @@ class IndieHackersCollector:
         """
         items = []
         
-        try:
-            # 抓取热门产品页面
-            url = "https://www.indiehackers.com/products"
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            }
-            response = requests.get(url, headers=headers, timeout=15)
-            
-            if response.status_code == 200:
-                html = response.text
-                
-                # 简单解析：查找产品标题和链接
-                # 格式：<a href="/products/xxx">Product Name</a>
-                pattern = r'<a href="(/products/[^"]+)">([^<]+)</a>'
-                matches = re.findall(pattern, html)
-                
-                for href, title in matches[:limit]:
-                    if title.strip() and 'products' in href:
-                        items.append({
-                            'id': f"ih_{href.split('/')[-1]}",
-                            'title': title.strip()[:200],
-                            'source': 'indiehackers',
-                            'url': f"https://www.indiehackers.com{href}",
-                            'score': 0,
-                            'description': f'IndieHackers 产品：{title.strip()}',
-                            'author': 'unknown',
-                            'created_at': ''
-                        })
-            
-            # 如果网页抓取失败，用备用方案：返回一些知名的 IndieHackers 案例
-            if not items:
-                items = self._get_fallback_cases(limit)
-                
-        except Exception as e:
-            print(f"Error fetching IndieHackers: {e}")
-            # 出错时返回备用案例
+        # 尝试 API 方案
+        items = self._fetch_api(limit)
+        
+        # API 失败则用备用案例
+        if not items:
             items = self._get_fallback_cases(limit)
         
         print(f"Got {len(items)} IndieHackers items")
         return items
     
+    def _fetch_api(self, limit: int) -> List[Dict[str, Any]]:
+        """尝试从 IndieHackers 获取真实数据"""
+        try:
+            # 使用公开的产品列表页面
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+            }
+            
+            # 尝试获取热门产品
+            response = requests.get(
+                'https://www.indiehackers.com/products',
+                headers=headers,
+                timeout=15
+            )
+            
+            if response.status_code == 200:
+                # 简单解析 HTML 获取产品链接
+                import re
+                pattern = r'href="(/products/[^"]+)"'
+                matches = re.findall(pattern, response.text)
+                
+                for href in matches[:limit]:
+                    # 获取产品详情
+                    product_url = f'https://www.indiehackers.com{href}'
+                    items.append({
+                        'id': f"ih_{href.split('/')[-1]}",
+                        'title': f'IndieHackers Product: {href.split("/")[-1]}',
+                        'source': 'indiehackers',
+                        'url': product_url,
+                        'score': 0,
+                        'description': f'Independent developer product from IndieHackers community',
+                        'author': 'unknown',
+                        'created_at': ''
+                    })
+                
+                if items:
+                    return items
+        except Exception as e:
+            print(f"IndieHackers API error: {e}")
+        
+        return []
+    
     def _get_fallback_cases(self, limit: int) -> List[Dict[str, Any]]:
-        """备用：返回一些知名的 IndieHackers 成功案例"""
+        """
+        备用：返回一些知名的 IndieHackers 成功案例
+        
+        这些是真实存在的经典案例，用于演示和测试
+        """
         fallback = [
             {
                 'id': 'ih_baremetrics',
