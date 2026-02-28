@@ -14,6 +14,7 @@
 import os
 import sys
 import json
+import asyncio
 import argparse
 from datetime import datetime
 from typing import List
@@ -88,6 +89,11 @@ def collect_data(hn_limit: int = 10, ph_limit: int = 5, twitter_limit: int = 20,
 
 def analyze_items(items: List[dict], min_score: int = 60) -> List[Opportunity]:
     """分析项目"""
+    return asyncio.run(analyze_items_async(items, min_score=min_score))
+
+
+async def analyze_items_async(items: List[dict], min_score: int = 60) -> List[Opportunity]:
+    """异步分析项目"""
     import logging
     logger = logging.getLogger(__name__)
     
@@ -98,7 +104,7 @@ def analyze_items(items: List[dict], min_score: int = 60) -> List[Opportunity]:
     analyzer = BailianAnalyzer()
     
     logger.info(f"Analyzing {len(items)} items (min_score={min_score})...")
-    opportunities = analyzer.batch_analyze(items, min_score=min_score)
+    opportunities = await analyzer.batch_analyze_async(items, min_score=min_score)
     logger.info(f"Found {len(opportunities)} opportunities")
     
     return opportunities
@@ -252,7 +258,7 @@ def main():
     
     # 正常运行
     items = collect_data(hn_limit=args.hn_limit, ph_limit=args.ph_limit)
-    opportunities = analyze_items(items, min_score=args.min_score)
+    opportunities = asyncio.run(analyze_items_async(items, min_score=args.min_score))
     
     if opportunities:
         save_results(opportunities)

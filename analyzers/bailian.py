@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """阿里百炼 API 分析器"""
 
+import asyncio
 import json
-import requests
-import time
 from typing import Dict, Any, Optional
 from datetime import datetime
+
+import aiohttp
 
 from config import BAILIAN_API_KEY, BAILIAN_MODEL, BAILIAN_ENDPOINT, DEBUG, BAILIAN_TIMEOUT
 from models.opportunity import Opportunity
@@ -22,7 +23,11 @@ class BailianAnalyzer:
         if not self.api_key:
             raise ValueError("BAILIAN_API_KEY not configured")
     
-    def analyze(self, item: Dict[str, Any]) -> Optional[Opportunity]:
+    async def analyze_async(
+        self,
+        item: Dict[str, Any],
+        session: Optional[aiohttp.ClientSession] = None
+    ) -> Optional[Opportunity]:
         """
         分析一个项目，生成机会评估（带重试机制）
         
@@ -34,62 +39,69 @@ class BailianAnalyzer:
         """
         max_retries = 3
         base_delay = 2  # 秒
-        
+
+        prompt = self._build_prompt(item)
+        payload = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "你是一个产品机会分析专家。分析技术新闻和产品，评估商业机会。输出严格的 JSON 格式。\n\n" + prompt
+                }
+            ],
+            "max_tokens": 1000,
+            "temperature": 0.7
+        }
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+
+        own_session = session is None
+        timeout = aiohttp.ClientTimeout(total=BAILIAN_TIMEOUT)
+        client = session or aiohttp.ClientSession(timeout=timeout)
+
         try:
             for attempt in range(max_retries):
                 try:
-                    prompt = self._build_prompt(item)
-                    
-                    response = requests.post(
+                    async with client.post(
                         self.endpoint,
-                        headers={
-                            "Authorization": f"Bearer {self.api_key}",
-                            "Content-Type": "application/json"
-                        },
-                        json={
-                            "model": self.model,
-                            "messages": [
-                                {
-                                    "role": "user",
-                                    "content": "你是一个产品机会分析专家。分析技术新闻和产品，评估商业机会。输出严格的 JSON 格式。\n\n" + prompt
-                                }
-                            ],
-                            "max_tokens": 1000,
-                            "temperature": 0.7
-                        },
-                        timeout=BAILIAN_TIMEOUT
-                    )
-                    
-                    if response.status_code == 429:  # Rate limited
-                        delay = base_delay * (2 ** attempt)
-                        print(f"Rate limited, retrying in {delay}s...")
-                        time.sleep(delay)
-                        continue
-                    
-                    if response.status_code != 200:
-                        print(f"API Error: {response.status_code}")
-                        print(f"Response: {response.text[:500]}")
-                        return None
-                    
-                    result = response.json()
-                    break  # Success
-                    
-                except requests.exceptions.Timeout:
+                        headers=headers,
+                        json=payload
+                    ) as response:
+                        if response.status == 429:  # Rate limited
+                            delay = base_delay * (2 ** attempt)
+                            print(f"Rate limited, retrying in {delay}s...")
+                            await asyncio.sleep(delay)
+                            continue
+
+                        if response.status != 200:
+                            response_text = await response.text()
+                            print(f"API Error: {response.status}")
+                            print(f"Response: {response_text[:500]}")
+                            return None
+
+                        result = await response.json()
+                        break  # Success
+
+                except (aiohttp.ServerTimeoutError, asyncio.TimeoutError):
                     if attempt < max_retries - 1:
                         delay = base_delay * (2 ** attempt)
                         print(f"Timeout, retrying in {delay}s...")
-                        time.sleep(delay)
+                        await asyncio.sleep(delay)
                     else:
                         print(f"Timeout after {max_retries} attempts")
                         return None
-                except requests.exceptions.RequestException as e:
+                except aiohttp.ClientError as e:
                     if attempt < max_retries - 1:
                         delay = base_delay * (2 ** attempt)
                         print(f"Request error: {e}, retrying in {delay}s...")
-                        time.sleep(delay)
+                        await asyncio.sleep(delay)
                     else:
                         print(f"Request failed after {max_retries} attempts: {e}")
                         return None
+            else:
+                return None
             
             # 处理成功的响应
             if DEBUG:
@@ -121,8 +133,11 @@ class BailianAnalyzer:
                 suggestion=analysis.get('suggestion', ''),
                 tags=analysis.get('tags', []),
                 description=analysis.get('description', ''),
+                market_size=analysis.get('market_size', ''),
                 business_model=analysis.get('business_model', ''),
                 competitors=analysis.get('competitors', ''),
+                barriers=analysis.get('barriers', ''),
+                risks=analysis.get('risks', ''),
                 source_url=item.get('url', ''),  # 原始链接
                 research_links=[
                     item.get('url', ''),
@@ -138,6 +153,13 @@ class BailianAnalyzer:
                 import traceback
                 traceback.print_exc()
             return None
+        finally:
+            if own_session:
+                await client.close()
+
+    def analyze(self, item: Dict[str, Any]) -> Optional[Opportunity]:
+        """同步兼容接口：内部调用异步实现"""
+        return asyncio.run(self.analyze_async(item))
     
     def _build_prompt(self, item: Dict[str, Any]) -> str:
         """构建分析提示词（投资尽调格式）"""
@@ -190,7 +212,7 @@ class BailianAnalyzer:
                     pass
             return None
     
-    def batch_analyze(self, items: list, min_score: int = 60) -> list:
+    async def batch_analyze_async(self, items: list, min_score: int = 60) -> list:
         """
         批量分析
         
@@ -202,14 +224,29 @@ class BailianAnalyzer:
             机会列表（按分数排序）
         """
         opportunities = []
-        
-        for item in items:
-            if DEBUG:
-                print(f"Analyzing: {item.get('title', '')[:50]}...")
-            
-            opp = self.analyze(item)
-            if opp and opp.score >= min_score:
-                opportunities.append(opp)
+        total = len(items)
+        semaphore = asyncio.Semaphore(5)
+        timeout = aiohttp.ClientTimeout(total=BAILIAN_TIMEOUT)
+
+        async def analyze_one(item: Dict[str, Any], session: aiohttp.ClientSession) -> Optional[Opportunity]:
+            async with semaphore:
+                if DEBUG:
+                    print(f"Analyzing: {item.get('title', '')[:50]}...")
+                return await self.analyze_async(item, session=session)
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            tasks = [asyncio.create_task(analyze_one(item, session)) for item in items]
+            completed = 0
+            for task in asyncio.as_completed(tasks):
+                opp = await task
+                completed += 1
+                print(f"Progress: {completed}/{total}")
+                if opp and opp.score >= min_score:
+                    opportunities.append(opp)
         
         # 按分数排序
         return sorted(opportunities, key=lambda x: x.score, reverse=True)
+
+    def batch_analyze(self, items: list, min_score: int = 60) -> list:
+        """同步兼容接口：内部调用异步实现"""
+        return asyncio.run(self.batch_analyze_async(items, min_score=min_score))
