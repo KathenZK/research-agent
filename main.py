@@ -23,7 +23,7 @@ from typing import List
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import DEBUG, DATA_DIR, LOG_DIR, BAILIAN_API_KEY, FEISHU_USER_ID, validate_config, GITHUB_TOKEN, GITHUB_REPO
-from collectors import HNCollector, PHCollector, TwitterCollector, ChineseMediaCollector, CrunchbaseCollector
+from collectors import HNCollector, PHCollector, ChineseMediaCollector
 from collectors.indiehackers import IndieHackersCollector
 from collectors.reddit import RedditCollector
 from analyzers import BailianAnalyzer
@@ -68,11 +68,6 @@ def collect_data(hn_limit: int = 10, ph_limit: int = 5, twitter_limit: int = 20,
     logger.info(f"Got {len(ph_items)} PH items")
     items.extend(ph_items)
     
-    # Twitter/X
-    logger.info(f"Fetching Twitter (limit={twitter_limit})...")
-    twitter_items = TwitterCollector.fetch(limit=twitter_limit)
-    logger.info(f"Got {len(twitter_items)} Twitter items")
-    items.extend(twitter_items)
     
     # Chinese Media (36Kr, Huxiu, etc.)
     logger.info(f"Fetching Chinese Media (hours={media_hours})...")
@@ -80,11 +75,6 @@ def collect_data(hn_limit: int = 10, ph_limit: int = 5, twitter_limit: int = 20,
     logger.info(f"Got {len(media_items)} Chinese media items")
     items.extend(media_items)
     
-    # Crunchbase (funding data)
-    logger.info(f"Fetching Crunchbase (limit={crunchbase_limit})...")
-    crunchbase_items = CrunchbaseCollector.fetch(limit=crunchbase_limit)
-    logger.info(f"Got {len(crunchbase_items)} Crunchbase items")
-    items.extend(crunchbase_items)
     
     # IndieHackers (solo founder stories)
     logger.info(f"Fetching IndieHackers (limit=15)...")
