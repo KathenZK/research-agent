@@ -1,36 +1,40 @@
 #!/usr/bin/env python3
-"""机会数据模型"""
+"""机会数据模型 - 一人公司视角"""
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 
 
 @dataclass
 class Opportunity:
-    """产品机会"""
+    """产品机会（一人公司 + Agent 军团视角）"""
     
     id: str
     title: str
-    source: str  # hn/ph/appstore/xiaohongshu
+    source: str
     url: str
-    score: int = 0  # 0-100 机会评分
-    summary: str = ""  # AI 生成的摘要
-    suggestion: str = ""  # AI 生成的建议方向
-    tags: list = field(default_factory=list)  # 标签
-    created_at: datetime = field(default_factory=datetime.now)
+    score: int = 0
+    summary: str = ""
+    description: str = ""
     
-    # 新增详细分析字段
-    description: str = ""  # 项目详细介绍（做什么的）
-    market_size: str = ""  # TAM/SAM/SOM 分析
-    business_model: str = ""  # 盈利模式
-    competitors: str = ""  # 竞争对手
-    barriers: str = ""  # 进入壁垒
-    risks: str = ""  # 风险评估
-    suggestion: str = ""  # 投资建议
-    tags: list = field(default_factory=list)  # 标签
-    source_url: str = ""  # 原始链接（在哪看到的）
-    research_links: list = field(default_factory=list)  # 研究链接
+    # 一人公司专属字段
+    solo_feasibility: str = ""
+    agent_roles: List[str] = field(default_factory=list)
+    startup_cost: str = ""
+    time_to_revenue: str = ""
+    revenue_model: str = ""
+    monthly_potential: str = ""
+    automation_rate: str = ""
+    customer_acquisition: str = ""
+    risks: str = ""
+    action_plan: str = ""
+    
+    # 通用字段
+    tags: List[str] = field(default_factory=list)
+    source_url: str = ""
+    research_links: List[str] = field(default_factory=list)
+    created_at: datetime = field(default_factory=datetime.now)
     
     def to_dict(self) -> dict:
         return {
@@ -41,12 +45,16 @@ class Opportunity:
             "score": self.score,
             "summary": self.summary,
             "description": self.description,
-            "market_size": self.market_size,
-            "business_model": self.business_model,
-            "competitors": self.competitors,
-            "barriers": self.barriers,
+            "solo_feasibility": self.solo_feasibility,
+            "agent_roles": self.agent_roles,
+            "startup_cost": self.startup_cost,
+            "time_to_revenue": self.time_to_revenue,
+            "revenue_model": self.revenue_model,
+            "monthly_potential": self.monthly_potential,
+            "automation_rate": self.automation_rate,
+            "customer_acquisition": self.customer_acquisition,
             "risks": self.risks,
-            "suggestion": self.suggestion,
+            "action_plan": self.action_plan,
             "tags": self.tags,
             "source_url": self.source_url,
             "research_links": self.research_links,
@@ -54,20 +62,19 @@ class Opportunity:
         }
     
     def to_message(self) -> str:
-        """生成飞书消息"""
+        """生成飞书消息（一人公司格式）"""
         emoji = {
             "hn": "🔥",
             "ph": "🚀",
             "twitter": "𝕏",
             "36kr": "📰",
             "huxiu": "🐯",
+            "tiehan": "💎",
             "crunchbase": "💰",
-            "appstore": "📱",
-            "xiaohongshu": "📕"
         }.get(self.source, "💡")
         
         return f"""
-{emoji} 【机会 #{self.id}】评分：{self.score}/100
+{emoji} 【一人公司机会 #{self.id}】评分：{self.score}/100
 
 📌 {self.title}
 🔗 来源：{self.source.upper()} | {self.url}
@@ -75,23 +82,24 @@ class Opportunity:
 📖 项目介绍
 {self.description if self.description else self.summary}
 
-📊 市场规模
-{self.market_size if self.market_size else "待分析"}
+👤 一人公司可行性
+{self.solo_feasibility if self.solo_feasibility else "待分析"}
 
-💰 盈利模式
-{self.business_model if self.business_model else "待分析"}
+🤖 需要的 Agent 角色
+{', '.join(self.agent_roles) if self.agent_roles else "待分析"}
 
-🏆 竞争格局
-{self.competitors if self.competitors else "待分析"}
+💰 启动成本：{self.startup_cost or "待分析"}
+⏱️ 多久见钱：{self.time_to_revenue or "待分析"}
+📈 收入模式：{self.revenue_model or "待分析"}
+🎯 月收入潜力：{self.monthly_potential or "待分析"}
+⚙️ 自动化率：{self.automation_rate or "待分析"}
+📢 获客渠道：{self.customer_acquisition or "待分析"}
 
-🚧 进入壁垒
-{self.barriers if self.barriers else "待分析"}
-
-⚠️ 风险评估
+⚠️ 风险
 {self.risks if self.risks else "待分析"}
 
-💡 投资建议
-{self.suggestion}
+🚀 第一步
+{self.action_plan if self.action_plan else "待分析"}
 
 {f"🏷️ 标签：{', '.join(self.tags)}" if self.tags else ""}
 ---

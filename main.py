@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import DEBUG, DATA_DIR, LOG_DIR, BAILIAN_API_KEY, FEISHU_USER_ID, validate_config
 from collectors import HNCollector, PHCollector, TwitterCollector, ChineseMediaCollector, CrunchbaseCollector
+from collectors.indiehackers import IndieHackersCollector
 from analyzers import BailianAnalyzer
 from models import Opportunity
 
@@ -83,6 +84,13 @@ def collect_data(hn_limit: int = 10, ph_limit: int = 5, twitter_limit: int = 20,
     crunchbase_items = CrunchbaseCollector.fetch(limit=crunchbase_limit)
     logger.info(f"Got {len(crunchbase_items)} Crunchbase items")
     items.extend(crunchbase_items)
+    
+    # IndieHackers (solo founder stories)
+    logger.info(f"Fetching IndieHackers (limit=15)...")
+    ih_collector = IndieHackersCollector()
+    ih_items = ih_collector.fetch(limit=15)
+    logger.info(f"Got {len(ih_items)} IndieHackers items")
+    items.extend(ih_items)
     
     return items
 
@@ -146,24 +154,31 @@ def save_results(opportunities: List[Opportunity]):
 
 
 def send_to_feishu(opportunities: List[Opportunity]):
-    """发送到飞书"""
+    """发送到飞书（通过 OpenClaw CLI）"""
     if not FEISHU_USER_ID:
         print("FEISHU_USER_ID not configured, skipping Feishu notification")
         return
     
     try:
-        # 使用 OpenClaw message 工具发送
-        # 这里简化处理，实际应该调用 OpenClaw API
-        print(f"Would send {len(opportunities)} opportunities to Feishu user {FEISHU_USER_ID}")
+        import subprocess
         
-        # TODO: 集成 OpenClaw message API
-        # from openclaw import message
-        # for opp in opportunities[:3]:  # 只发送 top 3
-        #     message.send(
-        #         channel="feishu",
-        #         target=FEISHU_USER_ID,
-        #         message=opp.to_message()
-        #     )
+        # 发送 Top 10
+        for opp in opportunities[:10]:
+            msg = opp.to_message()
+            cmd = [
+                "openclaw", "message", "send",
+                "--channel", "feishu",
+                "--target", f"user:{FEISHU_USER_ID}",
+                "--message", msg,
+                "--silent"
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode == 0:
+                print(f"✅ Sent to Feishu: {opp.title[:50]}...")
+            else:
+                print(f"⚠️  Send failed: {result.stderr[:100]}")
+        
+        print(f"✅ Sent Top {min(10, len(opportunities))} opportunities to Feishu")
         
     except Exception as e:
         print(f"Error sending to Feishu: {e}")
@@ -183,23 +198,22 @@ def print_results(opportunities: List[Opportunity]):
         print(f"   📖 项目介绍")
         print(f"   {opp.description[:200] if opp.description else opp.summary[:200]}...")
         print()
-        print(f"   📊 市场规模")
-        print(f"   {opp.market_size[:150] if opp.market_size else '待分析'}...")
+        print(f"   👤 一人公司可行性")
+        print(f"   {opp.solo_feasibility[:150] if opp.solo_feasibility else '待分析'}...")
         print()
-        print(f"   💰 盈利模式")
-        print(f"   {opp.business_model[:150] if opp.business_model else '待分析'}...")
+        print(f"   🤖 Agent 角色：{', '.join(opp.agent_roles) if opp.agent_roles else '待分析'}")
+        print(f"   💰 启动成本：{opp.startup_cost or '待分析'}")
+        print(f"   ⏱️ 多久见钱：{opp.time_to_revenue or '待分析'}")
+        print(f"   📈 收入模式：{opp.revenue_model or '待分析'}")
+        print(f"   🎯 月收入潜力：{opp.monthly_potential or '待分析'}")
+        print(f"   ⚙️ 自动化率：{opp.automation_rate or '待分析'}")
+        print(f"   📢 获客渠道：{opp.customer_acquisition or '待分析'}")
         print()
-        print(f"   🏆 竞争格局")
-        print(f"   {opp.competitors[:150] if opp.competitors else '待分析'}...")
-        print()
-        print(f"   🚧 进入壁垒")
-        print(f"   {opp.barriers[:150] if opp.barriers else '待分析'}...")
-        print()
-        print(f"   ⚠️ 风险评估")
+        print(f"   ⚠️ 风险")
         print(f"   {opp.risks[:150] if opp.risks else '待分析'}...")
         print()
-        print(f"   💡 投资建议")
-        print(f"   {opp.suggestion[:150]}...")
+        print(f"   🚀 第一步")
+        print(f"   {opp.action_plan[:100] if opp.action_plan else '待分析'}...")
         print()
         print(f"   🔗 相关链接")
         print(f"   - 原始链接：{opp.source_url}")
@@ -225,6 +239,7 @@ def main():
     parser.add_argument('--hn-limit', type=int, default=30, help='HN 获取数量')
     parser.add_argument('--ph-limit', type=int, default=20, help='PH 获取数量')
     parser.add_argument('--min-score', type=int, default=60, help='最低分数')
+    parser.add_argument('--indie-mode', action='store_true', help='一人公司模式：专注 Indie Hacker/微 SaaS/自动化机会')
     
     args = parser.parse_args()
     

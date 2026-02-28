@@ -122,7 +122,7 @@ class BailianAnalyzer:
             if not analysis:
                 return None
             
-            # 创建 Opportunity
+            # 创建 Opportunity（一人公司格式）
             return Opportunity(
                 id=item['id'],
                 title=item['title'],
@@ -130,15 +130,19 @@ class BailianAnalyzer:
                 url=item.get('url', ''),
                 score=analysis.get('score', 50),
                 summary=analysis.get('summary', ''),
-                suggestion=analysis.get('suggestion', ''),
-                tags=analysis.get('tags', []),
                 description=analysis.get('description', ''),
-                market_size=analysis.get('market_size', ''),
-                business_model=analysis.get('business_model', ''),
-                competitors=analysis.get('competitors', ''),
-                barriers=analysis.get('barriers', ''),
+                solo_feasibility=analysis.get('solo_feasibility', ''),
+                agent_roles=analysis.get('agent_roles', []),
+                startup_cost=analysis.get('startup_cost', ''),
+                time_to_revenue=analysis.get('time_to_revenue', ''),
+                revenue_model=analysis.get('revenue_model', ''),
+                monthly_potential=analysis.get('monthly_potential', ''),
+                automation_rate=analysis.get('automation_rate', ''),
+                customer_acquisition=analysis.get('customer_acquisition', ''),
                 risks=analysis.get('risks', ''),
-                source_url=item.get('url', ''),  # 原始链接
+                action_plan=analysis.get('action_plan', ''),
+                tags=analysis.get('tags', []),
+                source_url=item.get('url', ''),
                 research_links=[
                     item.get('url', ''),
                     f"https://www.google.com/search?q={item.get('title', '')}",
@@ -162,38 +166,41 @@ class BailianAnalyzer:
         return asyncio.run(self.analyze_async(item))
     
     def _build_prompt(self, item: Dict[str, Any]) -> str:
-        """构建分析提示词（投资尽调格式）"""
+        """构建分析提示词（一人公司 + Agent 军团视角）"""
         return f"""
-你是一级市场战略投资总监，请分析这个产品/新闻机会：
+你是一人公司成功创业者，擅长用 AI Agent 军团自动化业务。请分析这个机会：
 
 标题：{item.get('title', '')}
 来源：{item.get('source', 'unknown').upper()}
 链接：{item.get('url', '')}
 {f"描述：{item.get('description', '')[:500]}" if item.get('description') else ""}
 {f"热度：{item.get('score', 0)} 分" if item.get('score') else ""}
-{f"评论：{item.get('descendants', 0)} 条" if item.get('descendants') is not None else ""}
 
-请按照投资尽调框架详细分析：
+请从**一人公司 + Agent 军团**角度分析，判断是否适合 1 人干到年入百万美金：
 
 输出严格的 JSON 格式：
 {{
     "score": 75,
-    "summary": "50 字一句话总结",
-    "description": "200 字项目介绍：做什么、解决什么问题、目标用户",
-    "market_size": "150 字 TAM/SAM/SOM 分析：总体市场/可服务市场/可获得市场",
-    "business_model": "150 字盈利模式：如何赚钱、定价策略、LTV/CAC",
-    "competitors": "150 字竞争格局：直接竞品、间接竞品、竞争优势",
-    "barriers": "100 字进入壁垒：技术/资金/监管/网络效应壁垒",
-    "risks": "150 字风险评估：市场风险、技术风险、团队风险、监管风险",
-    "suggestion": "150 字投资建议：跟投/领投/观望，理由和估值建议",
-    "tags": ["AI", "SaaS", "B2B", "A 轮"]
+    "summary": "50 字一句话：为什么适合/不适合一人公司",
+    "description": "100 字：做什么、解决什么问题、目标用户",
+    "solo_feasibility": "150 字：为什么适合一人公司 + Agent 完成，哪些工作可自动化",
+    "agent_roles": ["内容 Agent", "客服 Agent", "开发 Agent", "营销 Agent"],
+    "startup_cost": "<$1k 或 $1-5k 或 $5-20k 或 >$20k",
+    "time_to_revenue": "<7 天 或 30 天 或 90 天 或 >90 天",
+    "revenue_model": "订阅 或 一次性 或 联盟 或 广告 或 API 收费",
+    "monthly_potential": "$1-10k 或 $10-50k 或 $50k+",
+    "automation_rate": "50% 或 70% 或 90%+",
+    "customer_acquisition": "SEO 或 社交媒体 或 付费广告 或 联盟 或 Product Hunt",
+    "risks": "50 字主要风险",
+    "action_plan": "50 字第一步做什么",
+    "tags": ["SaaS", "AI", "B2B", "内容", "自动化"]
 }}
 
-评分标准：
-- 90-100: 明确痛点 + 付费意愿强 + 竞争少 + 市场大 (>$10B) → 立即跟进
-- 70-89: 有需求 + 有市场 + 可差异化 → 深入研究
-- 50-69: 一般机会，需要验证 → 保持关注
-- 0-49: 不建议做 → 跳过
+评分标准（一人公司视角）：
+- 90-100: 启动成本低 (<$5k) + 30 天见钱 + 可 90% 自动化 + 月入$50k+ 潜力 → 立即开干
+- 70-89: 一人能完成 + 有明确获客渠道 + 月入$10-50k 潜力 → 深入研究
+- 50-69: 需要验证 + 可能需要外包部分工作 → 保持关注
+- 0-49: 需要团队/重资金/难自动化 → 跳过
 """
     
     def _parse_json(self, content: str) -> Optional[Dict]:
