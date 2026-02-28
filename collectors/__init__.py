@@ -1,13 +1,15 @@
+"""Collectors package"""
+
 from .hn import HNCollector
 from .ph import PHCollector
-from .twitter import TwitterCollector
 from .chinese_media import ChineseMediaCollector
-from .crunchbase import CrunchbaseCollector
+from .indiehackers import IndieHackersCollector
+from .reddit import RedditCollector
 
 __all__ = [
     'HNCollector',
-    'PHCollector', 
-    'TwitterCollector',
+    'PHCollector',
     'ChineseMediaCollector',
-    'CrunchbaseCollector'
+    'IndieHackersCollector',
+    'RedditCollector'
 ]
