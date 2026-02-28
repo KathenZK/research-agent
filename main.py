@@ -22,6 +22,7 @@ from typing import List
 # 添加项目路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from mvp_generator import MVPGenerator
 from config import DEBUG, DATA_DIR, LOG_DIR, BAILIAN_API_KEY, FEISHU_USER_ID, validate_config, GITHUB_TOKEN, GITHUB_REPO
 from collectors import HNCollector, PHCollector, ChineseMediaCollector
 from collectors.indiehackers import IndieHackersCollector
@@ -244,6 +245,39 @@ https://github.com/{GITHUB_REPO}/blob/main/opportunities/{opp.created_at.strftim
     print(f"✅ Created {created}/3 GitHub issues")
 
 
+
+
+def generate_mvps(opportunities: List[Opportunity]):
+    """为 Top 机会生成 MVP"""
+    print("\n🚀 Generating MVPs...")
+    
+    generator = MVPGenerator()
+    generated = 0
+    
+    for opp in opportunities[:2]:  # 只为 Top 2 生成 MVP
+        try:
+            opp_dict = {
+                'title': opp.title,
+                'summary': opp.summary,
+                'description': opp.description or opp.summary,
+                'score': opp.score,
+                'revenue_model': opp.revenue_model or 'Subscription',
+                'startup_cost': opp.startup_cost or '$1-5k',
+                'time_to_revenue': opp.time_to_revenue or '30 days',
+                'monthly_potential': opp.monthly_potential or '$10-50k',
+                'automation_rate': opp.automation_rate or '90%+',
+                'agent_roles': opp.agent_roles or ['Development Agent']
+            }
+            
+            project_dir = generator.generate(opp_dict)
+            if project_dir:
+                generated += 1
+                print(f"✅ Generated: {project_dir}")
+        except Exception as e:
+            print(f"⚠️  Failed to generate MVP for {opp.title}: {e}")
+    
+    print(f"\n✅ Generated {generated}/{len(opportunities[:2])} MVPs")
+
 def print_results(opportunities: List[Opportunity]):
     """打印结果"""
     print("\n" + "="*80)
@@ -340,6 +374,7 @@ def main():
         print_results(opportunities)
         send_to_feishu(opportunities)
         create_github_issues(opportunities)
+        generate_mvps(opportunities)
     else:
         print("未发现符合条件的机会")
 
