@@ -47,3 +47,13 @@ os.makedirs(LOG_DIR, exist_ok=True)
 
 # 调试模式
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
+
+# GitHub (自动创建 Issue)
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
+if not GITHUB_TOKEN:
+    try:
+        with open(os.path.expanduser("~/.github_token")) as f:
+            GITHUB_TOKEN = f.read().strip()
+    except:
+        GITHUB_TOKEN = ""
+GITHUB_REPO = os.getenv("GITHUB_REPO", "KathenZK/one-company-lab")
