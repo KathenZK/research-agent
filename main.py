@@ -235,7 +235,7 @@ https://github.com/{GITHUB_REPO}/blob/main/opportunities/{opp.created_at.strftim
 
 ---
 *Auto-created by Research Agent*""",
-                "labels": ["opportunity", "researching", "ai", "saas"] + opp.tags[:2]
+                "labels": ["opportunity", "researching", "ai"]
             }
             
             response = requests.post(url, headers=headers, json=data, timeout=30)
