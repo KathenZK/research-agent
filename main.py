@@ -124,6 +124,90 @@ async def analyze_items_async(items: List[dict], min_score: int = 60) -> List[Op
     return opportunities
 
 
+
+
+def _normalize_title(title: str) -> str:
+    import re
+    t = (title or '').lower()
+    t = re.sub(r'https?://\S+', '', t)
+    t = re.sub(r'[^\w\s\u4e00-\u9fff]', ' ', t)
+    t = re.sub(r'\s+', ' ', t).strip()
+    return t
+
+
+def deduplicate_opportunities(opportunities: List[Opportunity]) -> List[Opportunity]:
+    """按标题归一化去重：同类机会保留分数最高项"""
+    best = {}
+    for opp in opportunities:
+        key = _normalize_title(opp.title)[:120]
+        if not key:
+            continue
+        old = best.get(key)
+        if old is None or opp.score > old.score:
+            best[key] = opp
+    return list(best.values())
+
+
+def rerank_for_solo(opportunities: List[Opportunity]) -> List[Opportunity]:
+    """一人公司友好重排：在原始 score 上加轻量业务权重"""
+    def bonus(opp: Opportunity) -> int:
+        b = 0
+        text = f"{opp.revenue_model} {opp.time_to_revenue} {opp.automation_rate} {opp.source}".lower()
+        if any(k in text for k in ['subscription', '订阅', 'saas']):
+            b += 5
+        if any(k in text for k in ['<7', '30', '30 天', '7 天']):
+            b += 4
+        if '90' in text or '90%+' in text:
+            b += 4
+        if any(k in text for k in ['indiehackers', 'reddit_r/saas', 'product hunt', 'ph']):
+            b += 2
+        return b
+
+    ranked = sorted(opportunities, key=lambda o: (o.score + bonus(o), o.score), reverse=True)
+    return ranked
+
+
+def save_top10_report(opportunities: List[Opportunity]):
+    """输出 Top10 决策报告（markdown + latest）"""
+    if not opportunities:
+        return
+
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    report_file = os.path.join(DATA_DIR, f'top10_report_{ts}.md')
+    latest_file = os.path.join(DATA_DIR, 'latest_top10.md')
+
+    top = opportunities[:10]
+    lines = [
+        '# Top 10 一人公司机会日报',
+        '',
+        f'- 生成时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}',
+        f'- 样本数量: {len(opportunities)}',
+        '',
+    ]
+
+    for idx, o in enumerate(top, 1):
+        lines += [
+            f'## {idx}. {o.title}',
+            f'- 评分: **{o.score}/100**',
+            f'- 来源: `{o.source}`',
+            f'- 链接: {o.url}',
+            f'- 一人可行性: {o.solo_feasibility or "待分析"}',
+            f'- 启动成本: {o.startup_cost or "待分析"}',
+            f'- 见钱周期: {o.time_to_revenue or "待分析"}',
+            f'- 收入模式: {o.revenue_model or "待分析"}',
+            f'- 月潜力: {o.monthly_potential or "待分析"}',
+            f'- 第一步: {o.action_plan or "待分析"}',
+            '',
+        ]
+
+    content = '\n'.join(lines)
+    with open(report_file, 'w', encoding='utf-8') as f:
+        f.write(content)
+    with open(latest_file, 'w', encoding='utf-8') as f:
+        f.write(content)
+
+    print(f'Report saved: {report_file}')
+
 def save_results(opportunities: List[Opportunity]):
     """保存结果"""
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -393,9 +477,14 @@ def main():
         github_limit=args.github_limit,
     )
     opportunities = asyncio.run(analyze_items_async(items, min_score=args.min_score))
-    
+
     if opportunities:
+        # 下一轮：机会去重 + 一人公司重排 + Top10 决策报告
+        opportunities = deduplicate_opportunities(opportunities)
+        opportunities = rerank_for_solo(opportunities)
+
         save_results(opportunities)
+        save_top10_report(opportunities)
         print_results(opportunities)
         send_to_feishu(opportunities)
         create_github_issues(opportunities)

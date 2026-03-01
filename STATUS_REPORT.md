@@ -15,6 +15,12 @@
 - ✅ 补齐依赖：`beautifulsoup4`（GitHub Trending 解析必需）
 
 ### 验证结果
+
+### 下一轮增强（决策层）
+- ✅ 新增机会去重（同类标题归一化后保留高分项）
+- ✅ 新增一人公司友好重排（订阅制/见钱周期/自动化率加权）
+- ✅ 新增 Top10 决策报告输出：`data/top10_report_*.md` + `data/latest_top10.md`
+
 - ✅ `python3 main.py --test` 可正常执行
 - ✅ 日志中可看到 HN/PH/Chinese Media/IndieHackers/Reddit/GitHub Trending 全链路采集
 
