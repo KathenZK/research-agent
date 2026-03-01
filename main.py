@@ -49,8 +49,8 @@ def setup_logging():
     return loglib.getLogger(__name__)
 
 
-def collect_data(hn_limit: int = 10, ph_limit: int = 5, twitter_limit: int = 20, 
-                 media_hours: int = 48, crunchbase_limit: int = 10) -> List[dict]:
+def collect_data(hn_limit: int = 10, ph_limit: int = 5, media_hours: int = 48,
+                 indie_limit: int = 15, reddit_limit: int = 10, github_limit: int = 10) -> List[dict]:
     """收集数据"""
     import logging
     logger = logging.getLogger(__name__)
@@ -78,12 +78,26 @@ def collect_data(hn_limit: int = 10, ph_limit: int = 5, twitter_limit: int = 20,
     
     
     # IndieHackers (solo founder stories)
-    logger.info(f"Fetching IndieHackers (limit=15)...")
+    logger.info(f"Fetching IndieHackers (limit={indie_limit})...")
     ih_collector = IndieHackersCollector()
-    ih_items = ih_collector.fetch(limit=15)
+    ih_items = ih_collector.fetch(limit=indie_limit)
     logger.info(f"Got {len(ih_items)} IndieHackers items")
     items.extend(ih_items)
-    
+
+    # Reddit (entrepreneur / SaaS)
+    logger.info(f"Fetching Reddit (limit={reddit_limit})...")
+    reddit_collector = RedditCollector()
+    reddit_items = reddit_collector.fetch(limit=reddit_limit)
+    logger.info(f"Got {len(reddit_items)} Reddit items")
+    items.extend(reddit_items)
+
+    # GitHub Trending
+    logger.info(f"Fetching GitHub Trending (limit={github_limit})...")
+    gh_collector = GitHubTrendingCollector()
+    gh_items = gh_collector.fetch(limit=github_limit)
+    logger.info(f"Got {len(gh_items)} GitHub Trending items")
+    items.extend(gh_items)
+
     return items
 
 
@@ -333,6 +347,10 @@ def main():
     parser.add_argument('--hn-limit', type=int, default=30, help='HN 获取数量')
     parser.add_argument('--ph-limit', type=int, default=20, help='PH 获取数量')
     parser.add_argument('--min-score', type=int, default=60, help='最低分数')
+    parser.add_argument('--media-hours', type=int, default=48, help='中文媒体抓取时间窗口（小时）')
+    parser.add_argument('--indie-limit', type=int, default=15, help='IndieHackers 获取数量')
+    parser.add_argument('--reddit-limit', type=int, default=10, help='Reddit 获取数量')
+    parser.add_argument('--github-limit', type=int, default=10, help='GitHub Trending 获取数量')
     parser.add_argument('--indie-mode', action='store_true', help='一人公司模式：专注 Indie Hacker/微 SaaS/自动化机会')
     
     args = parser.parse_args()
@@ -359,14 +377,21 @@ def main():
     # 测试模式
     if args.test:
         logger.info("Test mode: fetching sample data...")
-        items = collect_data(hn_limit=5, ph_limit=3)
+        items = collect_data(hn_limit=5, ph_limit=3, media_hours=args.media_hours, indie_limit=min(5, args.indie_limit), reddit_limit=min(4, args.reddit_limit), github_limit=min(4, args.github_limit))
         print(f"Collected {len(items)} items")
         for item in items[:3]:
             print(f"  - {item['title']}")
         return
     
     # 正常运行
-    items = collect_data(hn_limit=args.hn_limit, ph_limit=args.ph_limit)
+    items = collect_data(
+        hn_limit=args.hn_limit,
+        ph_limit=args.ph_limit,
+        media_hours=args.media_hours,
+        indie_limit=args.indie_limit,
+        reddit_limit=args.reddit_limit,
+        github_limit=args.github_limit,
+    )
     opportunities = asyncio.run(analyze_items_async(items, min_score=args.min_score))
     
     if opportunities:

@@ -1,8 +1,8 @@
 # Research Agent - 战略投资情报系统
 
-> **版本**: v1.0  
-> **最后更新**: 2026-02-27  
-> **状态**: ✅ 生产就绪
+> **版本**: v1.1  
+> **最后更新**: 2026-03-01  
+> **状态**: ✅ 生产可用（第一轮修复完成）
 
 ---
 
@@ -169,6 +169,26 @@ python3 main.py --hn-limit 10 --ph-limit 5 --min-score 60
 ```
 
 ---
+
+
+## 新增参数（v1.1）
+
+```bash
+python3 main.py \
+  --hn-limit 30 \
+  --ph-limit 20 \
+  --media-hours 48 \
+  --indie-limit 15 \
+  --reddit-limit 10 \
+  --github-limit 10 \
+  --min-score 60
+```
+
+说明：
+- `--media-hours`：中文媒体时间窗口
+- `--indie-limit`：IndieHackers 抓取数量
+- `--reddit-limit`：Reddit 抓取数量
+- `--github-limit`：GitHub Trending 抓取数量
 
 ## 使用指南
 

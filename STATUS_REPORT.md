@@ -6,6 +6,20 @@
 
 ---
 
+## 🔧 2026-03-01 第一轮修复（已完成）
+
+### 修复项
+- ✅ 修复 `collectors/indiehackers.py` 中 `items` 未定义导致的运行报错
+- ✅ 主流程 `collect_data` 接入 Reddit 与 GitHub Trending（此前仅导入未执行）
+- ✅ 新增可调参数：`--media-hours`、`--indie-limit`、`--reddit-limit`、`--github-limit`
+- ✅ 补齐依赖：`beautifulsoup4`（GitHub Trending 解析必需）
+
+### 验证结果
+- ✅ `python3 main.py --test` 可正常执行
+- ✅ 日志中可看到 HN/PH/Chinese Media/IndieHackers/Reddit/GitHub Trending 全链路采集
+
+---
+
 ## 📊 完成情况总览
 
 | Phase | 任务 | 状态 | 完成时间 |

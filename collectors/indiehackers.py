@@ -32,6 +32,7 @@ class IndieHackersCollector:
     
     def _fetch_api(self, limit: int) -> List[Dict[str, Any]]:
         """尝试从 IndieHackers 获取真实数据"""
+        items: List[Dict[str, Any]] = []
         try:
             # 使用公开的产品列表页面
             headers = {
