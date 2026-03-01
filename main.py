@@ -244,14 +244,34 @@ def save_results(opportunities: List[Opportunity]):
 
 
 def send_to_feishu(opportunities: List[Opportunity]):
-    """发送到飞书（通过 OpenClaw CLI）"""
+    """发送到飞书（通过 OpenClaw CLI）
+
+    修复点：某些环境下 openclaw 会输出 config warnings，
+    但消息实际已发送。这里用“返回码 + 输出特征”双判定，避免误报失败。
+    """
     if not FEISHU_USER_ID:
         print("FEISHU_USER_ID not configured, skipping Feishu notification")
         return
-    
+
+    def _looks_delivered(stdout: str, stderr: str) -> bool:
+        text = f"{stdout}\n{stderr}".lower()
+        # 兼容不同输出格式
+        success_signals = [
+            '"messageid"',
+            '"chatid"',
+            ' via ',
+            'result',
+            'sent',
+            'delivered',
+        ]
+        return any(sig in text for sig in success_signals)
+
     try:
         import subprocess
-        
+
+        sent = 0
+        failed = 0
+
         # 发送 Top 10
         for opp in opportunities[:10]:
             msg = opp.to_message()
@@ -263,13 +283,22 @@ def send_to_feishu(opportunities: List[Opportunity]):
                 "--silent"
             ]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            if result.returncode == 0:
-                print(f"✅ Sent to Feishu: {opp.title[:50]}...")
+
+            delivered = (result.returncode == 0) or _looks_delivered(result.stdout, result.stderr)
+
+            if delivered:
+                sent += 1
+                if result.returncode != 0:
+                    print(f"✅ Sent to Feishu (with warnings): {opp.title[:50]}...")
+                else:
+                    print(f"✅ Sent to Feishu: {opp.title[:50]}...")
             else:
-                print(f"⚠️  Send failed: {result.stderr[:100]}")
-        
-        print(f"✅ Sent Top {min(10, len(opportunities))} opportunities to Feishu")
-        
+                failed += 1
+                err = (result.stderr or result.stdout or '').strip().replace('\n', ' ')
+                print(f"⚠️  Send failed: {err[:160]}")
+
+        print(f"✅ Feishu delivery summary: sent={sent}, failed={failed}, total={min(10, len(opportunities))}")
+
     except Exception as e:
         print(f"Error sending to Feishu: {e}")
 
