@@ -302,6 +302,35 @@ def save_top10_report(opportunities: List[Opportunity]):
 
     print(f'Report saved: {report_file}')
 
+
+
+def cleanup_old_data(retention_days: int = 14):
+    """清理历史机会快照，仅保留最近 N 天。"""
+    import re
+    cutoff = datetime.now() - timedelta(days=retention_days)
+    pattern = re.compile(r'^opportunities_(\d{8})_(\d{6})\.json$')
+
+    removed = 0
+    for name in os.listdir(DATA_DIR):
+        m = pattern.match(name)
+        if not m:
+            continue
+        dt_str = m.group(1) + m.group(2)
+        try:
+            dt = datetime.strptime(dt_str, '%Y%m%d%H%M%S')
+        except Exception:
+            continue
+        if dt < cutoff:
+            try:
+                os.remove(os.path.join(DATA_DIR, name))
+                removed += 1
+            except Exception:
+                pass
+
+    if removed:
+        print(f'Cleanup: removed {removed} old snapshot files (> {retention_days} days)')
+
+
 def save_results(opportunities: List[Opportunity]):
     """保存结果"""
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -335,6 +364,7 @@ def save_results(opportunities: List[Opportunity]):
         print(f"Error saving latest.json: {e}")
     
     print(f"Saved to {json_file}")
+    cleanup_old_data(retention_days=14)
 
 
 def send_to_feishu(opportunities: List[Opportunity]):
