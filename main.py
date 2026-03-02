@@ -16,8 +16,10 @@ import sys
 import json
 import asyncio
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List
+import hashlib
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 # 添加项目路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -133,6 +135,98 @@ def _normalize_title(title: str) -> str:
     t = re.sub(r'[^\w\s\u4e00-\u9fff]', ' ', t)
     t = re.sub(r'\s+', ' ', t).strip()
     return t
+
+
+
+
+def _normalize_url(url: str) -> str:
+    """URL 规范化：去掉常见追踪参数，统一域名/路径格式"""
+    if not url:
+        return ''
+    try:
+        u = urlparse(url.strip())
+        scheme = (u.scheme or 'https').lower()
+        netloc = (u.netloc or '').lower()
+        if netloc.startswith('www.'):
+            netloc = netloc[4:]
+        path = (u.path or '/').rstrip('/') or '/'
+
+        blocked_prefix = ('utm_', 'spm', 'from', 'source', 'ref', 'ref_src', 'fbclid', 'gclid', 'igshid', 'mkt_')
+        clean_q = []
+        for k, v in parse_qsl(u.query, keep_blank_values=False):
+            lk = k.lower()
+            if lk.startswith(blocked_prefix):
+                continue
+            clean_q.append((k, v))
+        clean_q.sort(key=lambda kv: kv[0])
+        query = urlencode(clean_q, doseq=True)
+
+        return urlunparse((scheme, netloc, path, '', query, ''))
+    except Exception:
+        return (url or '').strip()
+
+
+def _fingerprint_opportunity(opp: Opportunity) -> str:
+    title_norm = _normalize_title(opp.title)
+    canonical_url = _normalize_url(opp.url or opp.source_url or '')
+    domain = ''
+    try:
+        domain = urlparse(canonical_url).netloc.lower()
+    except Exception:
+        domain = ''
+    raw = f"{title_norm[:160]}|{domain}|{canonical_url}"
+    return hashlib.sha1(raw.encode('utf-8')).hexdigest()
+
+
+def _load_seen_fingerprints(days: int = 14):
+    seen_file = os.path.join(DATA_DIR, 'seen_fingerprints.json')
+    now = datetime.now()
+    cutoff = now - timedelta(days=days)
+    data = {'items': []}
+
+    if os.path.exists(seen_file):
+        try:
+            with open(seen_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception:
+            data = {'items': []}
+
+    kept = []
+    seen_map = {}
+    for it in data.get('items', []):
+        ts = it.get('seen_at', '')
+        fp = it.get('fp', '')
+        try:
+            dt = datetime.fromisoformat(ts)
+        except Exception:
+            continue
+        if dt >= cutoff and fp:
+            kept.append({'fp': fp, 'seen_at': ts})
+            seen_map[fp] = dt
+
+    return seen_file, kept, seen_map
+
+
+def deduplicate_across_days(opportunities: List[Opportunity], days: int = 14) -> List[Opportunity]:
+    """跨天去重：命中最近 N 天已见指纹则过滤"""
+    seen_file, kept_items, seen_map = _load_seen_fingerprints(days=days)
+
+    fresh = []
+    for opp in opportunities:
+        fp = _fingerprint_opportunity(opp)
+        if fp in seen_map:
+            continue
+        fresh.append(opp)
+        kept_items.append({'fp': fp, 'seen_at': datetime.now().isoformat()})
+        seen_map[fp] = datetime.now()
+
+    try:
+        with open(seen_file, 'w', encoding='utf-8') as f:
+            json.dump({'items': kept_items[-5000:]}, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f'Warning: failed to save seen_fingerprints: {e}')
+
+    return fresh
 
 
 def deduplicate_opportunities(opportunities: List[Opportunity]) -> List[Opportunity]:
@@ -508,8 +602,14 @@ def main():
     opportunities = asyncio.run(analyze_items_async(items, min_score=args.min_score))
 
     if opportunities:
-        # 下一轮：机会去重 + 一人公司重排 + Top10 决策报告
+        # 机会去重：当日去重 + 跨天去重 + 一人公司重排
         opportunities = deduplicate_opportunities(opportunities)
+        opportunities = deduplicate_across_days(opportunities, days=14)
+
+        if not opportunities:
+            print("本次机会均与近14天重复，已全部过滤")
+            return
+
         opportunities = rerank_for_solo(opportunities)
 
         save_results(opportunities)
