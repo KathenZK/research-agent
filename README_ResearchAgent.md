@@ -307,3 +307,18 @@ research-agent/
 ---
 
 *最后更新：2026-02-27 23:15*
+
+
+## Agent Reach 桥接（P1）
+
+已支持通过 `--enable-agent-reach` 接入社媒桥接采集：X / YouTube / Reddit。
+
+示例：
+```bash
+python3 main.py --enable-agent-reach --ar-limit 10
+```
+
+说明：
+- 会先运行健康检查并写入 `data/agent_reach_health.json`
+- 连续失败 3 次的平台自动熔断 24 小时
+- 熔断不影响主链路（HN/PH/中文媒体/IndieHackers/GitHub Trending）

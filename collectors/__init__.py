@@ -6,6 +6,7 @@ from .chinese_media import ChineseMediaCollector
 from .indiehackers import IndieHackersCollector
 from .reddit import RedditCollector
 from .github_trending import GitHubTrendingCollector
+from .agent_reach_bridge import AgentReachBridge
 
 __all__ = [
     'HNCollector',
@@ -13,5 +14,6 @@ __all__ = [
     'ChineseMediaCollector',
     'IndieHackersCollector',
     'RedditCollector',
-    'GitHubTrendingCollector'
+    'GitHubTrendingCollector',
+    'AgentReachBridge'
 ]

@@ -253,3 +253,12 @@ research-agent/
 ---
 
 *报告生成时间：2026-02-28 00:30*
+
+
+## 🔌 Agent Reach 桥接接入（2026-03-02）
+
+- ✅ 新增 `collectors/agent_reach_bridge.py`（P1: X / YouTube / Reddit）
+- ✅ 新增 CLI 参数：`--enable-agent-reach`、`--ar-limit`
+- ✅ 新增健康状态文件：`data/agent_reach_health.json`
+- ✅ 新增熔断机制：单平台连续失败 >=3 次，熔断 24h
+- ✅ 验证通过：`python3 main.py --test --enable-agent-reach --ar-limit 3`

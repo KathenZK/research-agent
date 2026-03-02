@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from mvp_generator import MVPGenerator
 from config import DEBUG, DATA_DIR, LOG_DIR, BAILIAN_API_KEY, FEISHU_USER_ID, validate_config, GITHUB_TOKEN, GITHUB_REPO
-from collectors import HNCollector, PHCollector, ChineseMediaCollector, GitHubTrendingCollector
+from collectors import HNCollector, PHCollector, ChineseMediaCollector, GitHubTrendingCollector, AgentReachBridge
 from collectors.indiehackers import IndieHackersCollector
 from collectors.reddit import RedditCollector
 from analyzers import BailianAnalyzer
@@ -52,7 +52,8 @@ def setup_logging():
 
 
 def collect_data(hn_limit: int = 10, ph_limit: int = 5, media_hours: int = 48,
-                 indie_limit: int = 15, reddit_limit: int = 10, github_limit: int = 10) -> List[dict]:
+                 indie_limit: int = 15, reddit_limit: int = 10, github_limit: int = 10,
+                 enable_agent_reach: bool = False, ar_limit: int = 10) -> List[dict]:
     """收集数据"""
     import logging
     logger = logging.getLogger(__name__)
@@ -86,19 +87,48 @@ def collect_data(hn_limit: int = 10, ph_limit: int = 5, media_hours: int = 48,
     logger.info(f"Got {len(ih_items)} IndieHackers items")
     items.extend(ih_items)
 
-    # Reddit (entrepreneur / SaaS)
-    logger.info(f"Fetching Reddit (limit={reddit_limit})...")
-    reddit_collector = RedditCollector()
-    reddit_items = reddit_collector.fetch(limit=reddit_limit)
-    logger.info(f"Got {len(reddit_items)} Reddit items")
-    items.extend(reddit_items)
-
     # GitHub Trending
     logger.info(f"Fetching GitHub Trending (limit={github_limit})...")
     gh_collector = GitHubTrendingCollector()
     gh_items = gh_collector.fetch(limit=github_limit)
     logger.info(f"Got {len(gh_items)} GitHub Trending items")
     items.extend(gh_items)
+
+    # fallback legacy Reddit collector (kept for compatibility)
+    if not enable_agent_reach:
+        logger.info(f"Fetching Reddit (limit={reddit_limit})...")
+        reddit_collector = RedditCollector()
+        reddit_items = reddit_collector.fetch(limit=reddit_limit)
+        logger.info(f"Got {len(reddit_items)} Reddit items")
+        items.extend(reddit_items)
+
+
+    # Agent Reach bridge (P1: X / YouTube / Reddit)
+    if enable_agent_reach:
+        logger.info(f"Fetching Agent Reach sources (limit={ar_limit})...")
+        ar = AgentReachBridge(DATA_DIR)
+        health = ar.check_health()
+
+        if health.get("x"):
+            x_items = ar.fetch_x(limit=ar_limit)
+            logger.info(f"Got {len(x_items)} Agent Reach X items")
+            items.extend(x_items)
+        else:
+            logger.info("Skip Agent Reach X (unhealthy)")
+
+        if health.get("youtube"):
+            y_items = ar.fetch_youtube(limit=ar_limit)
+            logger.info(f"Got {len(y_items)} Agent Reach YouTube items")
+            items.extend(y_items)
+        else:
+            logger.info("Skip Agent Reach YouTube (unhealthy)")
+
+        if health.get("reddit"):
+            r_items = ar.fetch_reddit(limit=ar_limit)
+            logger.info(f"Got {len(r_items)} Agent Reach Reddit items")
+            items.extend(r_items)
+        else:
+            logger.info("Skip Agent Reach Reddit (unhealthy)")
 
     return items
 
@@ -588,6 +618,8 @@ def main():
     parser.add_argument('--indie-limit', type=int, default=15, help='IndieHackers 获取数量')
     parser.add_argument('--reddit-limit', type=int, default=10, help='Reddit 获取数量')
     parser.add_argument('--github-limit', type=int, default=10, help='GitHub Trending 获取数量')
+    parser.add_argument('--enable-agent-reach', action='store_true', help='启用 Agent Reach 桥接采集（X/YouTube/Reddit）')
+    parser.add_argument('--ar-limit', type=int, default=10, help='Agent Reach 每平台抓取数量')
     parser.add_argument('--indie-mode', action='store_true', help='一人公司模式：专注 Indie Hacker/微 SaaS/自动化机会')
     
     args = parser.parse_args()
@@ -614,7 +646,7 @@ def main():
     # 测试模式
     if args.test:
         logger.info("Test mode: fetching sample data...")
-        items = collect_data(hn_limit=5, ph_limit=3, media_hours=args.media_hours, indie_limit=min(5, args.indie_limit), reddit_limit=min(4, args.reddit_limit), github_limit=min(4, args.github_limit))
+        items = collect_data(hn_limit=5, ph_limit=3, media_hours=args.media_hours, indie_limit=min(5, args.indie_limit), reddit_limit=min(4, args.reddit_limit), github_limit=min(4, args.github_limit), enable_agent_reach=args.enable_agent_reach, ar_limit=min(5, args.ar_limit))
         print(f"Collected {len(items)} items")
         for item in items[:3]:
             print(f"  - {item['title']}")
@@ -628,6 +660,8 @@ def main():
         indie_limit=args.indie_limit,
         reddit_limit=args.reddit_limit,
         github_limit=args.github_limit,
+        enable_agent_reach=args.enable_agent_reach,
+        ar_limit=args.ar_limit,
     )
     opportunities = asyncio.run(analyze_items_async(items, min_score=args.min_score))
 
