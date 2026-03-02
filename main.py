@@ -291,6 +291,31 @@ def rerank_for_solo(opportunities: List[Opportunity]) -> List[Opportunity]:
     return ranked
 
 
+
+
+def _opportunity_what(opp: Opportunity) -> str:
+    """项目是做什么（优先 description，其次 summary）。"""
+    base = (opp.description or opp.summary or '').strip()
+    if base:
+        return base
+    return f"围绕 {opp.title} 这个信号，抽象出可产品化场景，面向对应目标用户提供可复用的工具/服务。"
+
+
+def _opportunity_how(opp: Opportunity) -> str:
+    """怎么做（落地路径）。"""
+    if opp.action_plan:
+        return opp.action_plan.strip()
+    return "先做最小可行版本（MVP）→ 找10位种子用户验证 → 根据反馈迭代功能与定价。"
+
+
+def _opportunity_profit(opp: Opportunity) -> str:
+    """怎么盈利（商业模式 + 时间预期）。"""
+    model = (opp.revenue_model or '订阅').strip()
+    ttr = (opp.time_to_revenue or '30天').strip()
+    potential = (opp.monthly_potential or '$10-50k').strip()
+    return f"主要通过【{model}】变现，预计【{ttr}】看到首笔收入，月度潜力区间【{potential}】。"
+
+
 def save_top10_report(opportunities: List[Opportunity]):
     """输出 Top10 决策报告（markdown + latest）"""
     if not opportunities:
@@ -339,12 +364,22 @@ def save_top10_report(opportunities: List[Opportunity]):
             f'- 评分: **{o.score}/100**',
             f'- 来源: `{o.source}`',
             f'- 链接: {o.url}',
+            '',
+            f'### 这是什么项目（What）',
+            _opportunity_what(o),
+            '',
+            f'### 怎么做（How）',
+            _opportunity_how(o),
+            '',
+            f'### 怎么盈利（Money）',
+            _opportunity_profit(o),
+            '',
+            f'### 关键指标',
             f'- 一人可行性: {o.solo_feasibility or "待分析"}',
             f'- 启动成本: {o.startup_cost or "待分析"}',
             f'- 见钱周期: {o.time_to_revenue or "待分析"}',
             f'- 收入模式: {o.revenue_model or "待分析"}',
             f'- 月潜力: {o.monthly_potential or "待分析"}',
-            f'- 第一步: {o.action_plan or "待分析"}',
             '',
         ]
 
