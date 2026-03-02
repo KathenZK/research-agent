@@ -300,6 +300,29 @@ def save_top10_report(opportunities: List[Opportunity]):
     report_file = os.path.join(DATA_DIR, f'top10_report_{ts}.md')
     latest_file = os.path.join(DATA_DIR, 'latest_top10.md')
 
+    # Agent Reach 健康摘要
+    health_summary_lines = []
+    health_file = os.path.join(DATA_DIR, 'agent_reach_health.json')
+    if os.path.exists(health_file):
+        try:
+            h = json.load(open(health_file, 'r', encoding='utf-8'))
+            platforms = h.get('platforms', {})
+            health_summary_lines.append('## 每日健康摘要（Agent Reach）')
+            for name in ('x', 'youtube', 'reddit'):
+                p = platforms.get(name, {})
+                healthy = bool(p.get('healthy', False))
+                failures = int(p.get('failures', 0) or 0)
+                cooldown = p.get('cooldown_until') or ''
+                status = '可用' if healthy else '不可用'
+                if cooldown:
+                    status += f'（熔断至 {cooldown}）'
+                health_summary_lines.append(f'- {name}: {status} | 连续失败: {failures}')
+            health_summary_lines.append('')
+        except Exception as e:
+            health_summary_lines.append('## 每日健康摘要（Agent Reach）')
+            health_summary_lines.append(f'- 读取失败: {e}')
+            health_summary_lines.append('')
+
     top = opportunities[:10]
     lines = [
         '# Top 10 一人公司机会日报',
@@ -308,6 +331,7 @@ def save_top10_report(opportunities: List[Opportunity]):
         f'- 样本数量: {len(opportunities)}',
         '',
     ]
+    lines.extend(health_summary_lines)
 
     for idx, o in enumerate(top, 1):
         lines += [
