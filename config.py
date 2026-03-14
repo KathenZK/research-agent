@@ -31,6 +31,8 @@ def validate_config():
 FEISHU_APP_ID = os.getenv("FEISHU_APP_ID", "")
 FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET", "")
 FEISHU_USER_ID = os.getenv("FEISHU_USER_ID", "")
+FEISHU_INDEX_DOC_TOKEN = os.getenv("FEISHU_INDEX_DOC_TOKEN", "E1fVd6yOoo1kFOx0Nj6c0C3Fnib").strip()
+FEISHU_DOC_SYNC_ENABLED = os.getenv("FEISHU_DOC_SYNC_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 
 # 数据源配置
 HN_API_URL = "https://hacker-news.firebaseio.com/v0"

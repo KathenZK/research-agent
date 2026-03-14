@@ -19,13 +19,14 @@ import argparse
 from datetime import datetime, timedelta
 from typing import List
 import hashlib
+import subprocess
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 # 添加项目路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from mvp_generator import MVPGenerator
-from config import DEBUG, DATA_DIR, LOG_DIR, BAILIAN_API_KEY, FEISHU_USER_ID, validate_config, GITHUB_TOKEN, GITHUB_REPO
+from config import DEBUG, DATA_DIR, LOG_DIR, BAILIAN_API_KEY, FEISHU_USER_ID, FEISHU_INDEX_DOC_TOKEN, FEISHU_DOC_SYNC_ENABLED, validate_config, GITHUB_TOKEN, GITHUB_REPO
 from collectors import HNCollector, PHCollector, ChineseMediaCollector, GitHubTrendingCollector, AgentReachBridge
 from collectors.indiehackers import IndieHackersCollector
 from collectors.reddit import RedditCollector
@@ -392,7 +393,6 @@ def save_top10_report(opportunities: List[Opportunity]):
     print(f'Report saved: {report_file}')
 
 
-
 def cleanup_old_data(retention_days: int = 14):
     """清理历史机会快照，仅保留最近 N 天。"""
     import re
@@ -464,6 +464,9 @@ def send_to_feishu(opportunities: List[Opportunity]):
     """
     if not FEISHU_USER_ID:
         print("FEISHU_USER_ID not configured, skipping Feishu notification")
+        return
+    if FEISHU_USER_ID.strip().lower() in {"ou_xxx", "user_xxx", "open_id_xxx", "placeholder"}:
+        print("FEISHU_USER_ID is placeholder, skipping direct Feishu notification")
         return
 
     def _looks_delivered(stdout: str, stderr: str) -> bool:
