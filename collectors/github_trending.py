@@ -4,6 +4,8 @@
 import requests
 from typing import List, Dict, Any
 from datetime import datetime
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 class GitHubTrendingCollector:
@@ -12,6 +14,22 @@ class GitHubTrendingCollector:
     def __init__(self):
         self.base_url = "https://github.com/trending"
         self.languages = ["", "Python", "JavaScript", "TypeScript"]  # 空字符串表示全部
+
+    def _session(self) -> requests.Session:
+        session = requests.Session()
+        retry = Retry(
+            total=3,
+            connect=3,
+            read=3,
+            backoff_factor=1.0,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=frozenset(['GET']),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount('https://', adapter)
+        session.mount('http://', adapter)
+        return session
     
     def fetch(self, limit: int = 20) -> List[Dict[str, Any]]:
         """
@@ -41,7 +59,7 @@ class GitHubTrendingCollector:
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
         }
         
-        response = requests.get(self.base_url, headers=headers, timeout=30)
+        response = self._session().get(self.base_url, headers=headers, timeout=30)
         
         if response.status_code != 200:
             print(f"  GitHub Trending: HTTP {response.status_code}")

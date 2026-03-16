@@ -4,11 +4,30 @@
 import requests
 import time
 from typing import List, Dict, Any
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from config import HN_API_URL
 
 
 class HNCollector:
     """Hacker News 文章收集器"""
+
+    @staticmethod
+    def _session() -> requests.Session:
+        session = requests.Session()
+        retry = Retry(
+            total=3,
+            connect=3,
+            read=3,
+            backoff_factor=0.8,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=frozenset(['GET']),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount('https://', adapter)
+        session.mount('http://', adapter)
+        return session
     
     @staticmethod
     def fetch(limit: int = 30) -> List[Dict[str, Any]]:
@@ -22,8 +41,9 @@ class HNCollector:
             文章列表
         """
         try:
+            session = HNCollector._session()
             # 获取热门新闻 ID 列表
-            response = requests.get(
+            response = session.get(
                 f"{HN_API_URL}/topstories.json",
                 timeout=10
             )
@@ -38,7 +58,7 @@ class HNCollector:
                     if i > 0 and i % 10 == 0:
                         time.sleep(1)
                     
-                    item_response = requests.get(
+                    item_response = session.get(
                         f"{HN_API_URL}/item/{item_id}.json",
                         timeout=5
                     )
@@ -69,7 +89,8 @@ class HNCollector:
     def fetch_new(limit: int = 30) -> List[Dict[str, Any]]:
         """获取最新新闻"""
         try:
-            response = requests.get(
+            session = HNCollector._session()
+            response = session.get(
                 f"{HN_API_URL}/newstories.json",
                 timeout=10
             )
@@ -79,7 +100,7 @@ class HNCollector:
             items = []
             for item_id in new_ids:
                 try:
-                    item_response = requests.get(
+                    item_response = session.get(
                         f"{HN_API_URL}/item/{item_id}.json",
                         timeout=5
                     )

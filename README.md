@@ -39,8 +39,9 @@ python3 main.py
 ```
 
 输出：
-- 终端显示 Top 5 机会
+- 终端输出 Phase 1 solo-venture screener（Top1/Top0 + 过滤样本）
 - JSON 保存到 `data/` 目录
+- Markdown 报告保存为 `data/phase1_report_*.md` 与 `data/latest_phase1.md`
 - 日志保存到 `logs/` 目录
 
 ## 配置 OpenClaw Cron
@@ -67,6 +68,8 @@ python3 main.py --help
 --hn-limit      HN 获取数量 (默认 30)
 --ph-limit      PH 获取数量 (默认 20)
 --min-score     最低分数阈值 (默认 60)
+--enable-github-issues  显式启用 GitHub issue 创建
+--enable-mvp-generation 显式启用 MVP 自动生成
 --debug         调试模式
 --test          测试模式
 ```
@@ -74,20 +77,14 @@ python3 main.py --help
 ## 输出示例
 
 ```
-🔥 【机会 #47173121】
+Top1 | 保留观察 | 等级 B
+切入 wedge：不要复刻原产品，而是切其中最窄、最容易先收钱的工作流。
+14 天收钱：先卖一个可人工兜底的轻服务版本，验证是否有人愿意付首单。
+前 20 个用户：从原始帖子评论区、相关社区和现有人脉里做定向外联。
 
-📌 标题：Statement from Dario Amodei on our discussions with the Department of War
-🔗 来源：HN
-📊 评分：85/100
-🔗 链接：https://www.anthropic.com/news/...
-
-📝 摘要：
-Anthropic 与美国国防部合作，AI 安全讨论...
-
-💡 建议方向：
-AI 安全合规工具，面向政府/企业客户
-
-🏷️ 标签：AI, GovTech, B2B
+过滤样本：
+1. 暂不投入 | 等级 C | 14 天内收钱路径不够清晰
+2. 直接过滤 | 等级 D | 前 20 个用户来源不够具体
 ```
 
 ## 扩展数据源

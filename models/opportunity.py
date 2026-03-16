@@ -35,6 +35,24 @@ class Opportunity:
     source_url: str = ""
     research_links: List[str] = field(default_factory=list)
     created_at: datetime = field(default_factory=datetime.now)
+
+    def grade_label(self) -> str:
+        if self.score >= 85:
+            return "A"
+        if self.score >= 75:
+            return "B"
+        if self.score >= 65:
+            return "C"
+        return "D"
+
+    def decision_label(self) -> str:
+        mapping = {
+            "A": "立即验证",
+            "B": "保留观察",
+            "C": "暂不投入",
+            "D": "直接过滤",
+        }
+        return mapping[self.grade_label()]
     
     def to_dict(self) -> dict:
         return {
@@ -74,9 +92,9 @@ class Opportunity:
         }.get(self.source, "💡")
         
         return f"""
-{emoji} 【一人公司机会 #{self.id}】评分：{self.score}/100
+{emoji} 【一人公司机会 #{self.id}】{self.decision_label()} | 等级 {self.grade_label()}
 
-📌 {self.title}
+📌 切入 wedge：围绕「{self.title}」切一个最窄且可先收钱的工作流
 🔗 来源：{self.source.upper()} | {self.url}
 
 📖 项目介绍

@@ -17,21 +17,27 @@ import json
 import asyncio
 import argparse
 from datetime import datetime, timedelta
-from typing import List
+from typing import List, Optional
 import hashlib
 import subprocess
+import tempfile
+import re
+import shutil
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 # 添加项目路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from mvp_generator import MVPGenerator
-from config import DEBUG, DATA_DIR, LOG_DIR, BAILIAN_API_KEY, FEISHU_USER_ID, FEISHU_INDEX_DOC_TOKEN, FEISHU_DOC_SYNC_ENABLED, validate_config, GITHUB_TOKEN, GITHUB_REPO
+from config import DEBUG, DATA_DIR, LOG_DIR, BAILIAN_API_KEY, FEISHU_APP_ID, FEISHU_APP_SECRET, FEISHU_USER_ID, FEISHU_INDEX_DOC_TOKEN, FEISHU_DOC_SYNC_ENABLED, validate_config, GITHUB_TOKEN, GITHUB_REPO
 from collectors import HNCollector, PHCollector, ChineseMediaCollector, GitHubTrendingCollector, AgentReachBridge
 from collectors.indiehackers import IndieHackersCollector
 from collectors.reddit import RedditCollector
 from analyzers import BailianAnalyzer
 from models import Opportunity
+
+PHASE1_KEEP_MIN_SCORE = 75
+PHASE1_FILTER_LIMIT = 5
 
 
 def setup_logging():
@@ -292,6 +298,70 @@ def rerank_for_solo(opportunities: List[Opportunity]) -> List[Opportunity]:
     return ranked
 
 
+def _clean_text(text: str) -> str:
+    return re.sub(r'\s+', ' ', (text or '').strip())
+
+
+def _truncate(text: str, limit: int = 160) -> str:
+    text = _clean_text(text)
+    if len(text) <= limit:
+        return text
+    return text[:limit - 1].rstrip() + '…'
+
+
+def _score_grade(score: int) -> str:
+    if score >= 85:
+        return 'A'
+    if score >= 75:
+        return 'B'
+    if score >= 65:
+        return 'C'
+    return 'D'
+
+
+def _decision_label(score: int) -> str:
+    grade = _score_grade(score)
+    mapping = {
+        'A': '立即验证',
+        'B': '保留观察',
+        'C': '暂不投入',
+        'D': '直接过滤',
+    }
+    return mapping[grade]
+
+
+def _is_fast_payback_window(text: str) -> bool:
+    normalized = _clean_text(text).lower()
+    if not normalized:
+        return False
+    return any(token in normalized for token in ['7天', '14天', '两周', '2周', 'two week', '<7', '7 days', '14 days'])
+
+
+def _default_first_users_source(opp: Opportunity) -> str:
+    source = (opp.source or '').lower()
+    mapping = {
+        'hn': '从 Hacker News 原帖作者、评论区高互动用户和相关 Show HN 创作者里定向外联。',
+        'ph': '从 Product Hunt 发布页评论者、投票用户和同类产品的早期支持者里找首批试用者。',
+        'reddit': '从对应 subreddit 的发帖者、评论者和求推荐帖子里私信约访。',
+        'reddit_r/saas': '从 r/SaaS 的发帖者、评论者和求工具帖里私信约访。',
+        'github': '从相关仓库的 issue、discussion、star 用户和 README 反馈里找早期用户。',
+        'github_trending': '从相关仓库的 issue、discussion、star 用户和 README 反馈里找早期用户。',
+        'indiehackers': '从 IndieHackers 发帖作者、评论区和同类项目创始人网络中直接约访。',
+        '36kr': '从报道里出现的赛道从业者、微信群和相关服务商客户名单中做定向外联。',
+        'huxiu': '从报道里出现的赛道从业者、微信群和相关服务商客户名单中做定向外联。',
+    }
+    return mapping.get(source, '从原始信号对应的社区、评论区和现有人脉里做定向外联，先拿到 20 个深访/试用用户。')
+
+
+def _select_phase1_candidates(opportunities: List[Opportunity]) -> tuple[List[Opportunity], List[Opportunity]]:
+    kept: List[Opportunity] = []
+    filtered_pool = list(opportunities)
+    if opportunities and opportunities[0].score >= PHASE1_KEEP_MIN_SCORE:
+        kept = [opportunities[0]]
+        filtered_pool = opportunities[1:]
+    return kept, filtered_pool[:PHASE1_FILTER_LIMIT]
+
+
 
 
 def _opportunity_what(opp: Opportunity) -> str:
@@ -315,6 +385,190 @@ def _opportunity_profit(opp: Opportunity) -> str:
     ttr = (opp.time_to_revenue or '30天').strip()
     potential = (opp.monthly_potential or '$10-50k').strip()
     return f"主要通过【{model}】变现，预计【{ttr}】看到首笔收入，月度潜力区间【{potential}】。"
+
+
+def _wedge_statement(opp: Opportunity) -> str:
+    # TODO(Phase 2): replace this template with analyzer-native wedge extraction.
+    what = _truncate(_opportunity_what(opp), limit=180)
+    return f"不要复刻“{opp.title}”本身，而是切其中最窄、最容易先收钱的工作流：{what}"
+
+
+def _who_pays_in_14_days(opp: Opportunity) -> str:
+    model = _clean_text(opp.revenue_model or '一次性 setup fee 或按月订阅')
+    timing = _clean_text(opp.time_to_revenue)
+    if timing and _is_fast_payback_window(timing):
+        return f"优先卖给已经在主动找替代方案的早期客户，先用“{model}”收第一笔钱；当前分析判断见钱周期为“{timing}”。"
+    if timing:
+        return f"优先卖给痛点最强、可被直接外联触达的客户，收费方式先用“{model}”；但当前给出的见钱周期是“{timing}”，14 天内收钱仍需人工验证。"
+    return f"优先卖给已经在用手工流程或多工具拼接解决这个问题的人，先用“{model}”收第一笔钱；14 天内是否能成交，目前证据不足。"
+
+
+def _first_20_users_source(opp: Opportunity) -> str:
+    acquisition = _clean_text(opp.customer_acquisition)
+    if acquisition:
+        return acquisition
+    return _default_first_users_source(opp)
+
+
+def _why_solo_buildable(opp: Opportunity) -> str:
+    reasons = []
+    if opp.solo_feasibility:
+        reasons.append(_truncate(opp.solo_feasibility, limit=140))
+    if opp.startup_cost:
+        reasons.append(f"启动成本预估 {opp.startup_cost}")
+    if opp.automation_rate:
+        reasons.append(f"可自动化比例 {opp.automation_rate}")
+    if reasons:
+        return '；'.join(reasons[:3]) + '。'
+    return '先从人工服务 + 轻工具交付起步，单人也能在需求验证期内完成交付。'
+
+
+def _why_not_crushed(opp: Opportunity) -> str:
+    risk = _truncate(opp.risks, limit=120)
+    base = '这是一个窄切口工作流，先靠速度、人工兜底和深度场景理解收钱，通常不值得大玩家立刻下场复制。'
+    if risk:
+        return f"{base} 当前最需要防的不是巨头，而是 {risk}"
+    return base
+
+
+def _smallest_paid_mvp(opp: Opportunity) -> str:
+    plan = _clean_text(opp.action_plan)
+    if plan:
+        return f"最小收费版本应只承诺一个明确结果，先用表单/脚本/人工交付完成闭环。落地路径：{_truncate(plan, limit=180)}"
+    return '先做一个单入口、单输出、可人工兜底的收费 MVP，验证是否有人愿意为这一个结果付款。'
+
+
+def _filtered_reason(opp: Opportunity) -> str:
+    reasons = []
+    if opp.score < PHASE1_KEEP_MIN_SCORE:
+        reasons.append('未达到 Phase 1 保留阈值')
+    if not _is_fast_payback_window(opp.time_to_revenue):
+        reasons.append('14 天内收钱路径不够清晰')
+    if not _clean_text(opp.customer_acquisition):
+        reasons.append('前 20 个用户来源不够具体')
+    if not _clean_text(opp.solo_feasibility):
+        reasons.append('单人可交付边界不够明确')
+    if opp.risks:
+        reasons.append(f"主要风险：{_truncate(opp.risks, limit=80)}")
+    return '；'.join(reasons[:3]) if reasons else '当前更像泛机会，不是今天就该切进去的 wedge。'
+
+
+def _agent_reach_health_summary_lines() -> List[str]:
+    health_summary_lines = []
+    health_file = os.path.join(DATA_DIR, 'agent_reach_health.json')
+    if not os.path.exists(health_file):
+        return health_summary_lines
+
+    try:
+        h = json.load(open(health_file, 'r', encoding='utf-8'))
+        platforms = h.get('platforms', {})
+        health_summary_lines.append('## 每日健康摘要（Agent Reach）')
+        for name in ('x', 'youtube', 'reddit'):
+            p = platforms.get(name, {})
+            healthy = bool(p.get('healthy', False))
+            failures = int(p.get('failures', 0) or 0)
+            cooldown = p.get('cooldown_until') or ''
+            status = '可用' if healthy else '不可用'
+            if cooldown:
+                status += f'（熔断至 {cooldown}）'
+            health_summary_lines.append(f'- {name}: {status} | 连续失败: {failures}')
+        health_summary_lines.append('')
+    except Exception as e:
+        health_summary_lines.append('## 每日健康摘要（Agent Reach）')
+        health_summary_lines.append(f'- 读取失败: {e}')
+        health_summary_lines.append('')
+    return health_summary_lines
+
+
+def save_phase1_report(opportunities: List[Opportunity]):
+    """输出 Phase 1 solo-venture screener（markdown + latest）。"""
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    report_file = os.path.join(DATA_DIR, f'phase1_report_{ts}.md')
+    latest_file = os.path.join(DATA_DIR, 'latest_phase1.md')
+
+    kept, filtered = _select_phase1_candidates(opportunities)
+    lines = [
+        '# Phase 1 Solo Venture Screener',
+        '',
+        f'- 生成时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}',
+        f'- 候选池规模: {len(opportunities)}',
+        f'- 结论: {"Top1" if kept else "Top0"}',
+        '',
+    ]
+    lines.extend(_agent_reach_health_summary_lines())
+
+    if kept:
+        opp = kept[0]
+        lines.extend([
+            '## Keep Candidate',
+            f'- 决策: **{_decision_label(opp.score)}**',
+            f'- 等级: **{_score_grade(opp.score)}**',
+            f'- 来源: `{opp.source}`',
+            f'- 链接: {opp.url}',
+            '',
+            '### Wedge / 切入点',
+            _wedge_statement(opp),
+            '',
+            '### 谁会在 14 天内付钱',
+            _who_pays_in_14_days(opp),
+            '',
+            '### 前 20 个用户从哪里来',
+            _first_20_users_source(opp),
+            '',
+            '### 为什么适合 solo builder',
+            _why_solo_buildable(opp),
+            '',
+            '### 为什么不会立刻被大玩家碾压',
+            _why_not_crushed(opp),
+            '',
+            '### 最小可收费 MVP',
+            _smallest_paid_mvp(opp),
+            '',
+            '### 备注',
+            f'- 变现方式: {opp.revenue_model or "待验证"}',
+            f'- 见钱周期: {opp.time_to_revenue or "待验证"}',
+            f'- 启动成本: {opp.startup_cost or "待验证"}',
+            f'- 月潜力: {opp.monthly_potential or "待验证"}',
+            '',
+        ])
+    else:
+        lines.extend([
+            '## Top0',
+            '今天没有候选通过 Phase 1 保留门槛。',
+            '主要原因通常是 14 天内付费路径、前 20 个用户来源或单人可交付边界不够清晰。',
+            '',
+        ])
+
+    lines.extend([
+        '## Not Worth Doing Now',
+        '以下条目保留作样本，但不进入本轮 wedge 验证：',
+        '',
+    ])
+
+    if filtered:
+        for idx, opp in enumerate(filtered, 1):
+            lines.extend([
+                f'### {idx}. {opp.title}',
+                f'- 决策: **{_decision_label(opp.score)}**',
+                f'- 等级: **{_score_grade(opp.score)}**',
+                f'- 来源: `{opp.source}`',
+                f'- 理由: {_filtered_reason(opp)}',
+                f'- 链接: {opp.url}',
+                '',
+            ])
+    else:
+        lines.extend([
+            '- 无更多可列出的过滤样本。',
+            '',
+        ])
+
+    content = '\n'.join(lines)
+    with open(report_file, 'w', encoding='utf-8') as f:
+        f.write(content)
+    with open(latest_file, 'w', encoding='utf-8') as f:
+        f.write(content)
+
+    print(f'Phase 1 report saved: {report_file}')
 
 
 def save_top10_report(opportunities: List[Opportunity]):
@@ -391,6 +645,238 @@ def save_top10_report(opportunities: List[Opportunity]):
         f.write(content)
 
     print(f'Report saved: {report_file}')
+
+
+def _extract_real_feishu_doc_url(text: str) -> Optional[str]:
+    if not text:
+        return None
+    m = re.search(r'https://(?:[\w-]+\.)?feishu\.cn/docx/[A-Za-z0-9]+', text)
+    return m.group(0) if m else None
+
+
+def _looks_like_placeholder(value: str) -> bool:
+    v = (value or '').strip().lower()
+    return not v or v in {'cli_xxx', 'xxx', 'ou_xxx', 'user_xxx', 'open_id_xxx', 'placeholder'}
+
+
+def _resolve_feishu_credentials() -> tuple[Optional[str], Optional[str]]:
+    app_id = FEISHU_APP_ID
+    app_secret = FEISHU_APP_SECRET
+    if not _looks_like_placeholder(app_id) and not _looks_like_placeholder(app_secret):
+        return app_id, app_secret
+
+    try:
+        cfg_path = os.path.expanduser('~/.openclaw/openclaw.json')
+        with open(cfg_path, 'r', encoding='utf-8') as f:
+            cfg = json.load(f)
+        acct = (((cfg.get('channels') or {}).get('feishu') or {}).get('accounts') or {}).get('default') or {}
+        app_id = acct.get('appId') or app_id
+        app_secret = acct.get('appSecret') or app_secret
+    except Exception:
+        pass
+    return app_id, app_secret
+
+
+def sync_report_to_feishu(md_filename: str = 'latest_phase1.md', title: Optional[str] = None) -> Optional[str]:
+    """将指定 markdown 报告同步到 Feishu Doc，并返回可验证的真实 docx URL。"""
+    if not FEISHU_DOC_SYNC_ENABLED:
+        print("Feishu doc sync disabled, skipping")
+        return None
+    app_id, app_secret = _resolve_feishu_credentials()
+    if _looks_like_placeholder(app_id) or _looks_like_placeholder(app_secret):
+        print("FEISHU_APP_ID / FEISHU_APP_SECRET not configured, skipping Feishu doc sync")
+        return None
+
+    md_path = os.path.join(DATA_DIR, md_filename)
+    if not os.path.exists(md_path):
+        print(f"{md_filename} not found, skipping Feishu doc sync")
+        return None
+
+    title = title or f"Solo Venture Screener-{datetime.now().strftime('%Y-%m-%d')}"
+
+    node_script = r'''
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const Lark = require('@larksuiteoapi/node-sdk');
+
+const appId = process.env.FEISHU_APP_ID || '';
+const appSecret = process.env.FEISHU_APP_SECRET || '';
+const indexToken = (process.env.FEISHU_INDEX_DOC_TOKEN || '').trim();
+const title = process.env.FEISHU_DOC_TITLE || '机会洞察';
+const mdPath = process.env.FEISHU_MD_PATH;
+
+const client = new Lark.Client({
+  appId,
+  appSecret,
+  appType: Lark.AppType.SelfBuild,
+  domain: Lark.Domain.Feishu,
+});
+
+function cleanBlocksForDescendant(blocks) {
+  return blocks.map((block) => {
+    const { parent_id, ...cleanBlock } = block;
+    if (cleanBlock.block_type === 32 && typeof cleanBlock.children === 'string') {
+      cleanBlock.children = [cleanBlock.children];
+    }
+    if (cleanBlock.block_type === 31 && cleanBlock.table) {
+      const prop = cleanBlock.table.property || {};
+      cleanBlock.table = { property: { row_size: prop.row_size, column_size: prop.column_size, ...(prop.column_width ? {column_width: prop.column_width} : {}) } };
+    }
+    return cleanBlock;
+  });
+}
+
+async function convertMarkdown(markdown) {
+  const res = await client.docx.document.convert({ data: { content_type: 'markdown', content: markdown } });
+  if (res.code !== 0) throw new Error('convert failed: ' + res.msg);
+  return { blocks: res.data?.blocks || [], firstLevelBlockIds: res.data?.first_level_block_ids || [] };
+}
+
+async function clearDocumentContent(docToken) {
+  const existing = await client.docx.documentBlock.list({ path: { document_id: docToken } });
+  if (existing.code !== 0) throw new Error(existing.msg);
+  const childIds = (existing.data?.items || []).filter(b => b.parent_id === docToken && b.block_type !== 1).map(b => b.block_id);
+  if (childIds.length > 0) {
+    const del = await client.docx.documentBlockChildren.batchDelete({ path: { document_id: docToken, block_id: docToken }, data: { start_index: 0, end_index: childIds.length } });
+    if (del.code !== 0) throw new Error(del.msg);
+  }
+}
+
+async function writeMarkdown(docToken, markdown) {
+  await clearDocumentContent(docToken);
+  const { blocks, firstLevelBlockIds } = await convertMarkdown(markdown);
+  if (!blocks.length) return;
+  const res = await client.docx.documentBlockDescendant.create({
+    path: { document_id: docToken, block_id: docToken },
+    data: { children_id: firstLevelBlockIds, descendants: cleanBlocksForDescendant(blocks), index: -1 }
+  });
+  if (res.code !== 0) throw new Error('descendant create failed: ' + res.msg + ' (code ' + res.code + ')');
+}
+
+async function listAllBlocks(docToken) {
+  const res = await client.docx.documentBlock.list({ path: { document_id: docToken } });
+  if (res.code !== 0) throw new Error(res.msg);
+  return res.data?.items || [];
+}
+
+function headingLevel(type) {
+  return ({3:1,4:2,5:3})[type] || null;
+}
+
+async function insertUnderDocList(docToken, lineMarkdown) {
+  const blocks = await listAllBlocks(docToken);
+  const heading = blocks.find(b => {
+    const elems = b.text?.elements || [];
+    const text = elems.map(e => e?.text_run?.content || '').join('');
+    return text.trim() === '文档列表';
+  });
+  if (!heading) throw new Error('未找到“文档列表”区块');
+  const parentId = heading.parent_id || docToken;
+  const childrenRes = await client.docx.documentBlockChildren.get({ path: { document_id: docToken, block_id: parentId } });
+  if (childrenRes.code !== 0) throw new Error(childrenRes.msg);
+  const siblings = childrenRes.data?.items || [];
+  const hIdx = siblings.findIndex(s => s.block_id === heading.block_id);
+  if (hIdx < 0) throw new Error('未找到“文档列表”区块在父节点中的位置');
+  const hLevel = headingLevel(heading.block_type) || 99;
+  let insertIndex = siblings.length;
+  for (let i = hIdx + 1; i < siblings.length; i++) {
+    const lvl = headingLevel(siblings[i].block_type);
+    if (lvl !== null && lvl <= hLevel) {
+      insertIndex = i;
+      break;
+    }
+  }
+  const { blocks: newBlocks, firstLevelBlockIds } = await convertMarkdown(lineMarkdown);
+  const res = await client.docx.documentBlockDescendant.create({
+    path: { document_id: docToken, block_id: parentId },
+    data: { children_id: firstLevelBlockIds, descendants: cleanBlocksForDescendant(newBlocks), index: insertIndex }
+  });
+  if (res.code !== 0) throw new Error('index update failed: ' + res.msg + ' (code ' + res.code + ')');
+}
+
+(async () => {
+  const out = { created: false, write_ok: false, index_update_ok: false, doc_url: '', title, error: '', warning: '' };
+  try {
+    const markdown = fs.readFileSync(mdPath, 'utf8');
+    const created = await client.docx.document.create({ data: { title } });
+    if (created.code !== 0) throw new Error('create failed: ' + created.msg);
+    const docToken = created.data?.document?.document_id;
+    if (!docToken) throw new Error('create failed: missing document_id');
+    const docUrl = `https://feishu.cn/docx/${docToken}`;
+    if (!/^https:\/\/(?:[\w-]+\.)?feishu\.cn\/docx\/[A-Za-z0-9]+$/.test(docUrl)) {
+      throw new Error('returned doc URL is not a real Feishu docx URL');
+    }
+    out.created = true;
+    out.doc_url = docUrl;
+
+    await writeMarkdown(docToken, markdown);
+    out.write_ok = true;
+
+    if (indexToken) {
+      try {
+        const line = `- ${new Date().toISOString().slice(0,10)}: [${title}](${docUrl})`;
+        await insertUnderDocList(indexToken, line);
+        out.index_update_ok = true;
+      } catch (err) {
+        out.warning = err && err.message ? err.message : String(err);
+      }
+    }
+
+    console.log(JSON.stringify(out));
+  } catch (err) {
+    out.error = err && err.message ? err.message : String(err);
+    console.log(JSON.stringify(out));
+    process.exitCode = 1;
+  }
+})();
+'''
+
+    script_path = None
+    try:
+        with tempfile.NamedTemporaryFile('w', suffix='.js', delete=False, encoding='utf-8') as f:
+            f.write(node_script)
+            script_path = f.name
+
+        env = os.environ.copy()
+        env.update({
+            'FEISHU_APP_ID': app_id,
+            'FEISHU_APP_SECRET': app_secret,
+            'FEISHU_INDEX_DOC_TOKEN': FEISHU_INDEX_DOC_TOKEN,
+            'FEISHU_DOC_TITLE': title,
+            'FEISHU_MD_PATH': md_path,
+        })
+
+        npm_root = '/opt/homebrew/lib/node_modules/openclaw/node_modules'
+        env['NODE_PATH'] = f"{npm_root}:{env.get('NODE_PATH', '')}" if env.get('NODE_PATH') else npm_root
+
+        node_bin = shutil.which('node') or '/opt/homebrew/bin/node'
+        result = subprocess.run(
+            [node_bin, script_path],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=env,
+        )
+        out = (result.stdout or '').strip() or (result.stderr or '').strip()
+        url = _extract_real_feishu_doc_url(out)
+        if result.returncode == 0 and url:
+            print(f'Feishu daily doc: {url}')
+            return url
+        raise RuntimeError(out or 'unknown feishu doc sync error')
+    except Exception as e:
+        print(f'Feishu doc sync failed: {e}')
+        return None
+    finally:
+        try:
+            os.unlink(script_path)
+        except Exception:
+            pass
+
+
+def sync_top10_report_to_feishu() -> Optional[str]:
+    """兼容旧调用。"""
+    return sync_report_to_feishu(md_filename='latest_top10.md', title=f"机会洞察-{datetime.now().strftime('%Y-%m-%d')}")
 
 
 def cleanup_old_data(retention_days: int = 14):
@@ -621,6 +1107,36 @@ def generate_mvps(opportunities: List[Opportunity]):
     
     print(f"\n✅ Generated {generated}/{len(opportunities[:2])} MVPs")
 
+
+def print_phase1_results(kept: List[Opportunity], filtered: List[Opportunity], total_count: int):
+    """打印 Phase 1 screener 摘要。"""
+    print("\n" + "=" * 80)
+    print(f"Phase 1 Solo Venture Screener | 候选池 {total_count} 条")
+    print("=" * 80 + "\n")
+
+    if kept:
+        opp = kept[0]
+        print(f"Top1 | {_decision_label(opp.score)} | 等级 { _score_grade(opp.score) }")
+        print(f"切入 wedge：{_wedge_statement(opp)}")
+        print(f"14 天收钱：{_who_pays_in_14_days(opp)}")
+        print(f"前 20 个用户：{_first_20_users_source(opp)}")
+        print(f"Solo 可行性：{_why_solo_buildable(opp)}")
+        print(f"抗巨头逻辑：{_why_not_crushed(opp)}")
+        print(f"最小收费 MVP：{_smallest_paid_mvp(opp)}")
+        print(f"链接：{opp.url}")
+    else:
+        print("Top0 | 今天没有候选通过 Phase 1 保留门槛")
+
+    print("\n过滤样本：")
+    if filtered:
+        for idx, opp in enumerate(filtered, 1):
+            print(f"{idx}. {_decision_label(opp.score)} | 等级 {_score_grade(opp.score)} | {opp.title}")
+            print(f"   {_filtered_reason(opp)}")
+    else:
+        print("无更多可列出的过滤样本")
+    print()
+
+
 def print_results(opportunities: List[Opportunity]):
     """打印结果"""
     print("\n" + "="*80)
@@ -683,6 +1199,8 @@ def main():
     parser.add_argument('--enable-agent-reach', action='store_true', help='启用 Agent Reach 桥接采集（X/YouTube/Reddit）')
     parser.add_argument('--ar-limit', type=int, default=10, help='Agent Reach 每平台抓取数量')
     parser.add_argument('--indie-mode', action='store_true', help='一人公司模式：专注 Indie Hacker/微 SaaS/自动化机会')
+    parser.add_argument('--enable-github-issues', action='store_true', help='显式启用 GitHub issue 创建（默认关闭）')
+    parser.add_argument('--enable-mvp-generation', action='store_true', help='显式启用 MVP 自动生成（默认关闭）')
     
     args = parser.parse_args()
     
@@ -737,13 +1255,28 @@ def main():
             return
 
         opportunities = rerank_for_solo(opportunities)
+        kept_candidates, filtered_candidates = _select_phase1_candidates(opportunities)
 
         save_results(opportunities)
-        save_top10_report(opportunities)
-        print_results(opportunities)
-        send_to_feishu(opportunities)
-        create_github_issues(opportunities)
-        generate_mvps(opportunities)
+        save_phase1_report(opportunities)
+        feishu_doc_url = sync_report_to_feishu()
+        print_phase1_results(kept_candidates, filtered_candidates, len(opportunities))
+        if feishu_doc_url:
+            print(f"Verified Feishu doc URL: {feishu_doc_url}")
+        if kept_candidates:
+            send_to_feishu(kept_candidates)
+        else:
+            print("No kept candidate to send via direct Feishu message")
+
+        if args.enable_github_issues:
+            create_github_issues(kept_candidates)
+        else:
+            print("GitHub issue creation disabled in Phase 1; use --enable-github-issues to override")
+
+        if args.enable_mvp_generation:
+            generate_mvps(kept_candidates)
+        else:
+            print("MVP generation disabled in Phase 1; use --enable-mvp-generation to override")
     else:
         print("未发现符合条件的机会")
 
