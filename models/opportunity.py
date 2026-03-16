@@ -36,16 +36,23 @@ class Opportunity:
     research_links: List[str] = field(default_factory=list)
     created_at: datetime = field(default_factory=datetime.now)
 
+    def display_score(self) -> int:
+        return int(getattr(self, "phase2_adjusted_score", self.score) or 0)
+
     def grade_label(self) -> str:
-        if self.score >= 85:
+        score = self.display_score()
+        if score >= 86:
             return "A"
-        if self.score >= 75:
+        if score >= 78:
             return "B"
-        if self.score >= 65:
+        if score >= 68:
             return "C"
         return "D"
 
     def decision_label(self) -> str:
+        custom = getattr(self, "phase2_decision_label", "")
+        if custom:
+            return custom
         mapping = {
             "A": "立即验证",
             "B": "保留观察",
@@ -61,6 +68,7 @@ class Opportunity:
             "source": self.source,
             "url": self.url,
             "score": self.score,
+            "display_score": self.display_score(),
             "summary": self.summary,
             "description": self.description,
             "solo_feasibility": self.solo_feasibility,
@@ -76,7 +84,13 @@ class Opportunity:
             "tags": self.tags,
             "source_url": self.source_url,
             "research_links": self.research_links,
-            "created_at": self.created_at.isoformat()
+            "created_at": self.created_at.isoformat(),
+            "phase2_raw_score": getattr(self, "phase2_raw_score", self.score),
+            "phase2_evidence_score": getattr(self, "phase2_evidence_score", 0),
+            "phase2_verdict": getattr(self, "phase2_verdict", ""),
+            "phase2_decision_label": getattr(self, "phase2_decision_label", ""),
+            "phase2_wedge": getattr(self, "phase2_wedge", ""),
+            "phase2_filtered_reason": getattr(self, "phase2_filtered_reason", ""),
         }
     
     def to_message(self) -> str:
@@ -90,18 +104,24 @@ class Opportunity:
             "tiehan": "💎",
             "crunchbase": "💰",
         }.get(self.source, "💡")
+
+        wedge = getattr(self, "phase2_wedge", f"围绕「{self.title}」切一个最窄且可先收钱的工作流")
+        solo_logic = getattr(self, "phase2_solo_logic", self.solo_feasibility or "待分析")
+        first_users = getattr(self, "phase2_first_users", self.customer_acquisition or "待分析")
+        paid_mvp = getattr(self, "phase2_paid_mvp", self.action_plan or "待分析")
+        risk_logic = getattr(self, "phase2_not_crushed", self.risks or "待分析")
         
         return f"""
 {emoji} 【一人公司机会 #{self.id}】{self.decision_label()} | 等级 {self.grade_label()}
 
-📌 切入 wedge：围绕「{self.title}」切一个最窄且可先收钱的工作流
+📌 切入 wedge：{wedge}
 🔗 来源：{self.source.upper()} | {self.url}
 
 📖 项目介绍
 {self.description if self.description else self.summary}
 
 👤 一人公司可行性
-{self.solo_feasibility if self.solo_feasibility else "待分析"}
+{solo_logic}
 
 🤖 需要的 Agent 角色
 {', '.join(self.agent_roles) if self.agent_roles else "待分析"}
@@ -111,13 +131,13 @@ class Opportunity:
 📈 收入模式：{self.revenue_model or "待分析"}
 🎯 月收入潜力：{self.monthly_potential or "待分析"}
 ⚙️ 自动化率：{self.automation_rate or "待分析"}
-📢 获客渠道：{self.customer_acquisition or "待分析"}
+📢 前 20 个用户：{first_users}
 
 ⚠️ 风险
-{self.risks if self.risks else "待分析"}
+{risk_logic}
 
 🚀 第一步
-{self.action_plan if self.action_plan else "待分析"}
+{paid_mvp}
 
 {f"🏷️ 标签：{', '.join(self.tags)}" if self.tags else ""}
 ---

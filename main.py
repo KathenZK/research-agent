@@ -16,6 +16,7 @@ import sys
 import json
 import asyncio
 import argparse
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import List, Optional
 import hashlib
@@ -38,6 +39,30 @@ from models import Opportunity
 
 PHASE1_KEEP_MIN_SCORE = 75
 PHASE1_FILTER_LIMIT = 5
+PHASE2_WATCH_LIMIT = 3
+PHASE2_KEEP_MIN_SCORE = 83
+PHASE2_WATCH_MIN_SCORE = 72
+
+
+@dataclass
+class ScreeningAssessment:
+    raw_score: int
+    adjusted_score: int
+    verdict: str
+    evidence_score: int
+    strengths: List[str] = field(default_factory=list)
+    keep_gaps: List[str] = field(default_factory=list)
+    kill_reasons: List[str] = field(default_factory=list)
+    crowded_hits: List[str] = field(default_factory=list)
+    frontline_hits: List[str] = field(default_factory=list)
+    heavy_delivery_hits: List[str] = field(default_factory=list)
+    platform_dependency_hits: List[str] = field(default_factory=list)
+    category_label: str = ""
+    avoid_label: str = ""
+    target_user: str = ""
+    trigger_event: str = ""
+    deliverable: str = ""
+    first_users_hint: str = ""
 
 
 def setup_logging():
@@ -279,23 +304,21 @@ def deduplicate_opportunities(opportunities: List[Opportunity]) -> List[Opportun
     return list(best.values())
 
 
-def rerank_for_solo(opportunities: List[Opportunity]) -> List[Opportunity]:
-    """一人公司友好重排：在原始 score 上加轻量业务权重"""
-    def bonus(opp: Opportunity) -> int:
-        b = 0
-        text = f"{opp.revenue_model} {opp.time_to_revenue} {opp.automation_rate} {opp.source}".lower()
-        if any(k in text for k in ['subscription', '订阅', 'saas']):
-            b += 5
-        if any(k in text for k in ['<7', '30', '30 天', '7 天']):
-            b += 4
-        if '90' in text or '90%+' in text:
-            b += 4
-        if any(k in text for k in ['indiehackers', 'reddit_r/saas', 'product hunt', 'ph']):
-            b += 2
-        return b
+def rerank_for_solo(opportunities: List[Opportunity], assessments: Optional[dict] = None) -> List[Opportunity]:
+    """Phase 2 重排：先看 verdict，再看证据强度和筛选分。"""
+    assessments = assessments or {opp.id: _build_phase2_assessment(opp) for opp in opportunities}
+    verdict_order = {'keep': 0, 'watch': 1, 'drop': 2}
 
-    ranked = sorted(opportunities, key=lambda o: (o.score + bonus(o), o.score), reverse=True)
-    return ranked
+    def sort_key(opp: Opportunity):
+        assessment = assessments.get(opp.id) or _build_phase2_assessment(opp)
+        return (
+            verdict_order.get(assessment.verdict, 3),
+            -assessment.evidence_score,
+            -assessment.adjusted_score,
+            -assessment.raw_score,
+        )
+
+    return sorted(opportunities, key=sort_key)
 
 
 def _clean_text(text: str) -> str:
@@ -309,17 +332,126 @@ def _truncate(text: str, limit: int = 160) -> str:
     return text[:limit - 1].rstrip() + '…'
 
 
+PHASE2_CATEGORY_PROFILES = [
+    {
+        'name': 'billing_analytics',
+        'terms': ['stripe', 'billing', 'mrr', 'churn', 'failed payment', 'subscription analytics', '支付', '订阅分析', '营收分析'],
+        'category_label': '支付/订阅分析',
+        'avoid_label': '完整的 Stripe 分析仪表盘',
+        'default_target': '使用 Stripe 的 20-200 人 SaaS 团队创始人或营收负责人',
+        'trigger': '每周复盘 MRR、流失和失败扣款时',
+        'deliverable': '一份可直接执行的 failed payment 与流失诊断报告',
+        'first_users_hint': '去 Indie Hackers、Stripe 开发者社区和讨论 churn / failed payment 的 SaaS 创始人帖子里定向约 20 人',
+        'crowded': True,
+    },
+    {
+        'name': 'project_management',
+        'terms': ['project management', 'task management', 'kanban', 'roadmap', 'sprint', '项目管理', '任务管理', '协作工具'],
+        'category_label': '项目管理',
+        'avoid_label': '一个新的项目管理工具',
+        'default_target': '2-10 人远程产品团队的创始人或项目负责人',
+        'trigger': '周会前或 sprint 切换时',
+        'deliverable': '一份自动清理过期任务并标出 blocker 的周会摘要',
+        'first_users_hint': '去 Indie Hackers、Linear/Jira/Notion 模板帖和远程团队社群里约首批 20 个团队负责人',
+        'crowded': True,
+    },
+    {
+        'name': 'ai_coding',
+        'terms': ['code generation', 'coding assistant', 'ai coding', 'developer tool', '开发工具', '代码生成', 'claude code', 'copilot', 'agent computer'],
+        'category_label': 'AI 开发工具',
+        'avoid_label': '一个通用 AI 编程助手',
+        'default_target': '维护单一代码栈的 3-20 人开发团队负责人',
+        'trigger': '需要新建模块、补测试或做迁移时',
+        'deliverable': '一个针对单一框架的脚手架、测试补全或迁移包',
+        'first_users_hint': '去 GitHub issues/discussions、Claude Code/Copilot 讨论区和开发者社群里找首批 20 个团队',
+        'crowded': True,
+    },
+    {
+        'name': 'transcription',
+        'terms': ['speech to text', 'voice', 'dictation', 'transcription', '语音', '转文字', '语音输入', '语音识别'],
+        'category_label': '语音转写',
+        'avoid_label': '一个通用语音输入工具',
+        'default_target': '每天要开会、访谈或写长文的 Mac 知识工作者',
+        'trigger': '会议、访谈或边走边记刚结束时',
+        'deliverable': '一份结构化纪要、待办列表和可直接发送的草稿',
+        'first_users_hint': '去写作者社区、播客/访谈从业者群和高频会议团队里约首批 20 个重度用户',
+        'crowded': True,
+    },
+    {
+        'name': 'focus_audio',
+        'terms': ['white noise', 'focus app', 'meditation', '白噪音', '专注', 'focus', '音频'],
+        'category_label': '专注/白噪音',
+        'avoid_label': '一个白噪音或专注应用',
+        'default_target': '需要长时间深度工作的远程知识工作者',
+        'trigger': '准备进入 60-90 分钟深度工作前',
+        'deliverable': '一套带番茄钟和专注复盘的深度工作 session',
+        'first_users_hint': '去深度工作、ADHD、远程办公社区里找愿意做 7 天专注实验的首批用户',
+        'crowded': True,
+    },
+    {
+        'name': 'content_training',
+        'terms': ['how i', 'best practice', 'playbook', 'training', 'course', '教程', '培训', '内容'],
+        'category_label': '内容/培训',
+        'avoid_label': '一个泛 AI 编程内容站或培训课',
+        'default_target': '想把 AI 编程流程标准化的 3-20 人工程团队负责人',
+        'trigger': '团队开始要求统一 prompt、review checklist 和交付规范时',
+        'deliverable': '一份基于真实代码库的 AI 编程 playbook 与评审清单',
+        'first_users_hint': '去 HN 评论区、工程管理社群和已有 AI 编程实践分享帖下定向约访 20 个团队负责人',
+        'crowded': False,
+    },
+]
+
+PHASE2_BIG_PLAYER_TERMS = {
+    'apple': 'Apple',
+    'ios': 'Apple',
+    'macos': 'Apple',
+    'google': 'Google',
+    'microsoft': 'Microsoft',
+    'openai': 'OpenAI',
+    'anthropic': 'Anthropic',
+    'claude': 'Claude',
+    'github copilot': 'GitHub Copilot',
+    'copilot': 'GitHub Copilot',
+    'notion': 'Notion',
+    'linear': 'Linear',
+    'jira': 'Jira',
+    'slack': 'Slack',
+    'figma': 'Figma',
+    'stripe': 'Stripe',
+    'deepgram': 'Deepgram',
+}
+
+PHASE2_HEAVY_DELIVERY_TERMS = [
+    'implementation service', 'consulting service', 'custom implementation', 'system integration',
+    'enterprise onboarding', 'deployment service', 'marketplace', 'two-sided', 'hardware', 'logistics',
+    '代运营', '咨询服务', '定制开发', '实施服务', '系统集成', '私有化部署', '硬件', '供应链', '双边市场'
+]
+PHASE2_GENERIC_ACQUISITION_TERMS = ['seo', 'product hunt', 'social media', '社交媒体', '付费广告', '广告', '联盟', 'app store', 'aso']
+PHASE2_SPECIFIC_ACQUISITION_TERMS = ['评论区', '帖子', '私信', '外联', '邮件', '名单', '社群', 'issue', 'discussion', 'subreddit', 'slack', 'discord', '论坛', '微信群', '评论者', '创始人', '群', '用户访谈']
+PHASE2_VAGUE_ACQUISITION_TERMS = ['cold outreach', 'outbound', 'linkedin', '朋友圈', '转介绍', 'partnership', 'bd', '销售', '社群运营', '社区运营', 'founder network']
+PHASE2_SIGNAL_WEAK_TERMS = ['融资', 'funding', 'launch', 'show hn', 'how i', 'essay', 'story', '案例', '教程', 'newsletter']
+PHASE2_PLATFORM_DEPENDENCY_TERMS = ['api变更', 'api 变更', '官方', '自带', '依赖单一', '单一平台', 'policy', 'policies', '平台策略']
+PHASE2_GENERIC_PLAN_TERMS = ['先做mvp', '先做 MVP', '根据反馈迭代', '再迭代', '验证需求', '上线看看', '先上线', 'build mvp', 'iterate', 'launch on product hunt']
+PHASE2_CONCRETE_PLAN_TERMS = ['试点', '审计', '脚本', '人工', '报价', '收取', '收费', '外联', '迁移', '报告', '清单', '访谈', '名单', 'pilot', 'audit', 'migration', 'report']
+
+
 def _score_grade(score: int) -> str:
-    if score >= 85:
+    if score >= 86:
         return 'A'
-    if score >= 75:
+    if score >= 78:
         return 'B'
-    if score >= 65:
+    if score >= 68:
         return 'C'
     return 'D'
 
 
-def _decision_label(score: int) -> str:
+def _decision_label(score: int, verdict: Optional[str] = None) -> str:
+    if verdict == 'keep':
+        return '立即验证'
+    if verdict == 'watch':
+        return '保留观察'
+    if verdict == 'drop':
+        return '暂不投入' if score >= 60 else '直接过滤'
     grade = _score_grade(score)
     mapping = {
         'A': '立即验证',
@@ -337,7 +469,121 @@ def _is_fast_payback_window(text: str) -> bool:
     return any(token in normalized for token in ['7天', '14天', '两周', '2周', 'two week', '<7', '7 days', '14 days'])
 
 
-def _default_first_users_source(opp: Opportunity) -> str:
+def _is_medium_payback_window(text: str) -> bool:
+    normalized = _clean_text(text).lower()
+    if not normalized:
+        return False
+    return any(token in normalized for token in ['30天', '30 天', '30 days', '30days', '一个月'])
+
+
+def _combined_signal_text(opp: Opportunity) -> tuple[str, str]:
+    raw = ' '.join([
+        opp.title or '',
+        opp.summary or '',
+        opp.description or '',
+        opp.risks or '',
+        ' '.join(opp.tags or []),
+        opp.customer_acquisition or '',
+        opp.solo_feasibility or '',
+        opp.action_plan or '',
+    ]).strip()
+    return raw, raw.lower()
+
+
+def _match_terms(text: str, phrases: List[str]) -> List[str]:
+    hits = []
+    for phrase in phrases:
+        if phrase and phrase in text:
+            hits.append(phrase)
+    return hits
+
+
+def _normalize_term(term: str) -> str:
+    return term.replace('_', ' ').replace('/', ' / ').strip()
+
+
+def _pick_phase2_profile(text_lower: str) -> Optional[dict]:
+    best = None
+    best_score = 0
+    for profile in PHASE2_CATEGORY_PROFILES:
+        score = sum(1 for term in profile['terms'] if term in text_lower)
+        if score > best_score:
+            best = profile
+            best_score = score
+    return best if best_score > 0 else None
+
+
+def _extract_target_user(opp: Opportunity, profile: Optional[dict]) -> str:
+    haystack = ' '.join([opp.description or '', opp.summary or ''])
+    patterns = [
+        r'目标用户为([^。；\n]+)',
+        r'目标用户是([^。；\n]+)',
+        r'面向([^。；\n]+)',
+        r'目标客户为([^。；\n]+)',
+        r'target users? (?:are|is)\s+([^.;\n]+)',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, haystack, re.IGNORECASE)
+        if match:
+            candidate = _truncate(match.group(1), limit=60)
+            if candidate:
+                return candidate
+    if profile:
+        return profile['default_target']
+    tags = {tag.lower() for tag in opp.tags or []}
+    if 'b2b' in tags:
+        return '有明确业务流程痛点的 B2B 团队负责人'
+    if 'b2c' in tags:
+        return '高频使用该场景、愿意先付费试用的重度个人用户'
+    return '对这个问题已经在用手工流程兜底的人'
+
+
+def _is_generic_acquisition_text(text: str) -> bool:
+    normalized = _clean_text(text).lower()
+    if not normalized:
+        return True
+    has_specific = any(token in normalized for token in PHASE2_SPECIFIC_ACQUISITION_TERMS)
+    generic_hits = [token for token in PHASE2_GENERIC_ACQUISITION_TERMS if token in normalized]
+    return bool(generic_hits) and not has_specific
+
+
+def _has_specific_acquisition_text(text: str) -> bool:
+    return _acquisition_specificity_level(text) >= 2
+
+
+def _acquisition_specificity_level(text: str) -> int:
+    normalized = _clean_text(text).lower()
+    if not normalized:
+        return 0
+    if _is_generic_acquisition_text(text):
+        return 0
+
+    specific_hits = sum(1 for token in PHASE2_SPECIFIC_ACQUISITION_TERMS if token in normalized)
+    vague_hits = sum(1 for token in PHASE2_VAGUE_ACQUISITION_TERMS if token in normalized)
+    named_community = bool(re.search(r'r/[a-z0-9_]+|github|reddit|hacker news|indie hackers|shopify|stripe|slack|discord|微信群|论坛', normalized))
+    countable_targets = bool(re.search(r'(前|首批|先找)\s*\d{1,3}\s*(个)?(用户|客户|团队|公司|商家|founders?|teams?|companies?)', normalized))
+
+    if (specific_hits >= 2) or (specific_hits >= 1 and (named_community or countable_targets)):
+        return 2
+    if countable_targets and not vague_hits:
+        return 1
+    if len(normalized) >= 30 and specific_hits >= 1 and vague_hits == 0:
+        return 1
+    return 0
+
+
+def _is_generic_action_plan(text: str) -> bool:
+    normalized = _clean_text(text).lower()
+    if not normalized:
+        return True
+    generic_hit = any(token.lower() in normalized for token in PHASE2_GENERIC_PLAN_TERMS)
+    concrete_hit = any(token.lower() in normalized for token in PHASE2_CONCRETE_PLAN_TERMS)
+    if generic_hit and not concrete_hit:
+        return True
+    return not concrete_hit and len(normalized) < 24
+
+
+def _default_first_users_source(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
     source = (opp.source or '').lower()
     mapping = {
         'hn': '从 Hacker News 原帖作者、评论区高互动用户和相关 Show HN 创作者里定向外联。',
@@ -350,18 +596,204 @@ def _default_first_users_source(opp: Opportunity) -> str:
         '36kr': '从报道里出现的赛道从业者、微信群和相关服务商客户名单中做定向外联。',
         'huxiu': '从报道里出现的赛道从业者、微信群和相关服务商客户名单中做定向外联。',
     }
+    if assessment and assessment.first_users_hint:
+        return assessment.first_users_hint + '。'
     return mapping.get(source, '从原始信号对应的社区、评论区和现有人脉里做定向外联，先拿到 20 个深访/试用用户。')
 
 
-def _select_phase1_candidates(opportunities: List[Opportunity]) -> tuple[List[Opportunity], List[Opportunity]]:
-    kept: List[Opportunity] = []
-    filtered_pool = list(opportunities)
-    if opportunities and opportunities[0].score >= PHASE1_KEEP_MIN_SCORE:
-        kept = [opportunities[0]]
-        filtered_pool = opportunities[1:]
-    return kept, filtered_pool[:PHASE1_FILTER_LIMIT]
+def _build_phase2_assessment(opp: Opportunity) -> ScreeningAssessment:
+    _, text_lower = _combined_signal_text(opp)
+    profile = _pick_phase2_profile(text_lower)
+    target_user = _extract_target_user(opp, profile)
+    trigger_event = profile['trigger'] if profile else '用户最着急解决这个问题时'
+    deliverable = profile['deliverable'] if profile else '一个单点可收费结果'
+    avoid_label = profile['avoid_label'] if profile else f'一个泛化复制“{opp.title}”的产品'
+    first_users_hint = profile['first_users_hint'] if profile else ''
 
+    raw_score = int(opp.score or 0)
+    adjusted_score = raw_score
+    evidence_score = 0
+    strengths: List[str] = []
+    keep_gaps: List[str] = []
+    crowded_hits: List[str] = []
+    frontline_hits: List[str] = []
+    heavy_delivery_hits: List[str] = []
+    platform_dependency_hits: List[str] = []
+    kill_reasons: List[str] = []
 
+    if _is_fast_payback_window(opp.time_to_revenue):
+        evidence_score += 2
+        adjusted_score += 6
+        strengths.append(f'见钱周期已压到 {opp.time_to_revenue}')
+    elif _is_medium_payback_window(opp.time_to_revenue):
+        keep_gaps.append('给出的见钱周期仍是 30 天量级，离 14 天首单还有距离')
+        adjusted_score -= 9
+    else:
+        keep_gaps.append('没有看到 14 天内能成交的付费窗口')
+        adjusted_score -= 12
+
+    acquisition_level = _acquisition_specificity_level(opp.customer_acquisition)
+    if acquisition_level >= 2:
+        evidence_score += 2
+        adjusted_score += 5
+        strengths.append('前 20 个用户来源相对具体')
+    elif acquisition_level == 1:
+        keep_gaps.append('首批用户来源写了方向，但还没有具体到马上可开找的帖子、评论者或客户名单')
+        adjusted_score -= 4
+    else:
+        keep_gaps.append('首批用户来源还停留在泛渠道词，没有变成可执行名单')
+        adjusted_score -= 9
+
+    if profile:
+        evidence_score += 1
+        adjusted_score += 3
+        strengths.append(f'目标切口至少落在“{profile["category_label"]}”这个具体工作流上')
+    else:
+        keep_gaps.append('机会描述仍然太宽，像类目词，不像一个可先收钱的窄工作流')
+        adjusted_score -= 8
+
+    if opp.startup_cost:
+        startup_cost = _clean_text(opp.startup_cost).lower()
+        if any(token in startup_cost for token in ['<$1k', '$1-5k', '<$5k']):
+            adjusted_score += 3
+            strengths.append(f'启动成本压在 {opp.startup_cost}')
+        elif any(token in startup_cost for token in ['>$20k', '$5-20k']):
+            keep_gaps.append(f'启动成本已经来到 {opp.startup_cost}')
+            adjusted_score -= 7
+
+    if opp.automation_rate:
+        auto_text = _clean_text(opp.automation_rate).lower()
+        if '90' in auto_text:
+            adjusted_score += 2
+            strengths.append(f'可自动化比例达到 {opp.automation_rate}')
+        elif '50' in auto_text:
+            adjusted_score -= 3
+
+    if opp.action_plan:
+        if _is_generic_action_plan(opp.action_plan):
+            keep_gaps.append('第一步仍然是“先做 MVP 再迭代”式模板话，没有落到首单交付动作')
+            adjusted_score -= 8
+        else:
+            evidence_score += 1
+            adjusted_score += 4
+            strengths.append('首单动作已经落到可执行交付')
+    else:
+        keep_gaps.append('没有写清 7-14 天内怎么拿首单')
+        adjusted_score -= 8
+
+    source = (opp.source or '').lower()
+    if source.startswith('reddit') or source in {'github', 'github_trending', 'x'}:
+        evidence_score += 1
+        adjusted_score += 2
+        strengths.append(f'{opp.source} 更接近真实需求现场')
+    elif source == 'indiehackers' and re.search(r'\$\d|mrr', (opp.title or '').lower()):
+        keep_gaps.append('这是成功案例信号，不是未满足需求本身')
+        adjusted_score -= 8
+    elif source == 'hn' and any(term in text_lower for term in ['how i', 'show hn', 'essay']):
+        keep_gaps.append('这是经验分享/展示，不是用户催着付钱的强需求信号')
+        adjusted_score -= 7
+    elif source in {'36kr', 'huxiu', 'tiehan'}:
+        keep_gaps.append('媒体报道更像行业观察，不足以直接证明首单需求')
+        adjusted_score -= 6
+
+    if profile and profile.get('crowded'):
+        crowded_hits.append(profile['category_label'])
+        adjusted_score -= 14
+
+    broad_market_hits = _match_terms(text_lower, ['project management', 'white noise', 'speech to text', 'code generation', 'agent computer', '生产力工具'])
+    for hit in broad_market_hits:
+        label = _normalize_term(hit)
+        if label not in crowded_hits:
+            crowded_hits.append(label)
+    adjusted_score -= min(10, max(0, len(broad_market_hits) - 1) * 4)
+
+    risks_text = _clean_text(opp.risks).lower()
+    for term, label in PHASE2_BIG_PLAYER_TERMS.items():
+        if term in text_lower or term in risks_text:
+            if label not in frontline_hits:
+                frontline_hits.append(label)
+    if any(token in risks_text for token in ['竞争激烈', '大厂', '官方', '自带', '原生']) and frontline_hits:
+        adjusted_score -= 16
+    elif frontline_hits and profile and profile.get('crowded'):
+        adjusted_score -= 12
+
+    heavy_delivery_hits.extend(_match_terms(text_lower, PHASE2_HEAVY_DELIVERY_TERMS))
+    if heavy_delivery_hits:
+        adjusted_score -= 18
+        keep_gaps.append('交付明显偏向重实施/重集成，不像能被单人稳定复制的高毛利模型')
+
+    platform_dependency_hits.extend(_match_terms(risks_text, PHASE2_PLATFORM_DEPENDENCY_TERMS))
+    if platform_dependency_hits:
+        adjusted_score -= 9
+
+    weak_signal_hits = _match_terms(text_lower, PHASE2_SIGNAL_WEAK_TERMS)
+    if weak_signal_hits and source in {'hn', 'ph', 'indiehackers', '36kr', 'huxiu'}:
+        adjusted_score -= 6
+
+    if any(token in text_lower for token in ['all-in-one', '平台', 'suite', 'workspace', '系统']) and not profile:
+        adjusted_score -= 8
+        keep_gaps.append('叙述里还是平台/全家桶语言，没有压缩到单结果交付')
+
+    adjusted_score = max(0, min(95, adjusted_score))
+
+    if crowded_hits and frontline_hits:
+        names = '、'.join(frontline_hits[:2])
+        category = profile['category_label'] if profile else '这个类目'
+        kill_reasons.append(f'这是 {category} 的主战场，用户默认会先比较 {names} 这类现成方案；单人新项目很容易被拖进功能和价格战。')
+    elif crowded_hits:
+        category = crowded_hits[0]
+        kill_reasons.append(f'{category} 已经是成熟红海类目，当前信号没有暴露出一个足够锋利、能先收钱的切口。')
+
+    if heavy_delivery_hits:
+        kill_reasons.append('首单也许能靠定制/实施拿下，但交付会持续吞掉创始人时间，不符合一人公司高毛利模型。')
+
+    if platform_dependency_hits and frontline_hits:
+        names = '、'.join(frontline_hits[:2])
+        kill_reasons.append(f'价值链过度挂在 {names} 等平台上，平台补功能或改接口就会削弱你的定价权。')
+
+    if keep_gaps and not _is_fast_payback_window(opp.time_to_revenue):
+        kill_reasons.append('现在更多是“有人会讨论/会注册”，不是“有人会在 14 天内掏钱催你交付”。')
+
+    critical_red_flags = bool(heavy_delivery_hits) or (bool(crowded_hits) and bool(frontline_hits))
+    if (
+        adjusted_score >= PHASE2_KEEP_MIN_SCORE
+        and evidence_score >= 5
+        and _is_fast_payback_window(opp.time_to_revenue)
+        and acquisition_level >= 2
+        and not _is_generic_action_plan(opp.action_plan)
+        and not critical_red_flags
+    ):
+        verdict = 'keep'
+    elif (
+        adjusted_score >= PHASE2_WATCH_MIN_SCORE
+        and evidence_score >= 3
+        and not heavy_delivery_hits
+        and len(crowded_hits) <= 1
+        and len(frontline_hits) <= 1
+    ):
+        verdict = 'watch'
+    else:
+        verdict = 'drop'
+
+    return ScreeningAssessment(
+        raw_score=raw_score,
+        adjusted_score=adjusted_score,
+        verdict=verdict,
+        evidence_score=evidence_score,
+        strengths=strengths,
+        keep_gaps=keep_gaps,
+        kill_reasons=kill_reasons,
+        crowded_hits=crowded_hits,
+        frontline_hits=frontline_hits,
+        heavy_delivery_hits=[_normalize_term(hit) for hit in heavy_delivery_hits[:3]],
+        platform_dependency_hits=[_normalize_term(hit) for hit in platform_dependency_hits[:3]],
+        category_label=profile['category_label'] if profile else '',
+        avoid_label=avoid_label,
+        target_user=target_user,
+        trigger_event=trigger_event,
+        deliverable=deliverable,
+        first_users_hint=first_users_hint,
+    )
 
 
 def _opportunity_what(opp: Opportunity) -> str:
@@ -387,30 +819,39 @@ def _opportunity_profit(opp: Opportunity) -> str:
     return f"主要通过【{model}】变现，预计【{ttr}】看到首笔收入，月度潜力区间【{potential}】。"
 
 
-def _wedge_statement(opp: Opportunity) -> str:
-    # TODO(Phase 2): replace this template with analyzer-native wedge extraction.
-    what = _truncate(_opportunity_what(opp), limit=180)
-    return f"不要复刻“{opp.title}”本身，而是切其中最窄、最容易先收钱的工作流：{what}"
+def _wedge_statement(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
+    assessment = assessment or _build_phase2_assessment(opp)
+    target = assessment.target_user or '一小撮已经在手工兜底的人'
+    trigger = assessment.trigger_event or '用户最着急解决问题时'
+    deliverable = assessment.deliverable or '一个单点可收费结果'
+    prefix = f'别做{assessment.avoid_label}，先切「{target}在{trigger}要拿到{deliverable}」这一刀'
+    if assessment.verdict == 'keep':
+        return prefix + '，先用脚本 + 人工兜底把这一个结果卖出去。'
+    return prefix + '。但当前证据还不够证明这刀能在 14 天内先收钱。'
 
 
-def _who_pays_in_14_days(opp: Opportunity) -> str:
+def _who_pays_in_14_days(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
+    assessment = assessment or _build_phase2_assessment(opp)
     model = _clean_text(opp.revenue_model or '一次性 setup fee 或按月订阅')
-    timing = _clean_text(opp.time_to_revenue)
-    if timing and _is_fast_payback_window(timing):
-        return f"优先卖给已经在主动找替代方案的早期客户，先用“{model}”收第一笔钱；当前分析判断见钱周期为“{timing}”。"
-    if timing:
-        return f"优先卖给痛点最强、可被直接外联触达的客户，收费方式先用“{model}”；但当前给出的见钱周期是“{timing}”，14 天内收钱仍需人工验证。"
-    return f"优先卖给已经在用手工流程或多工具拼接解决这个问题的人，先用“{model}”收第一笔钱；14 天内是否能成交，目前证据不足。"
+    target = assessment.target_user or '最痛的那批用户'
+    deliverable = assessment.deliverable or '一个明确结果'
+    if _is_fast_payback_window(opp.time_to_revenue):
+        return f'最可能先付钱的是 {target} 里刚经历过这个触发场景的人，先卖“{deliverable}”的 {model} 版本。'
+    return f'现在还看不到 14 天内会主动掏钱的买家名单。理论上应先找 {target}，用“{deliverable}”试卖一单，但证据还不够。'
 
 
-def _first_20_users_source(opp: Opportunity) -> str:
+def _first_20_users_source(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
+    assessment = assessment or _build_phase2_assessment(opp)
     acquisition = _clean_text(opp.customer_acquisition)
-    if acquisition:
+    if acquisition and not _is_generic_acquisition_text(acquisition):
         return acquisition
-    return _default_first_users_source(opp)
+    if acquisition:
+        return f'{_default_first_users_source(opp, assessment)} 当前模型只给了“{acquisition}”这类泛渠道词，还不算真正的首客名单。'
+    return _default_first_users_source(opp, assessment)
 
 
-def _why_solo_buildable(opp: Opportunity) -> str:
+def _why_solo_buildable(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
+    assessment = assessment or _build_phase2_assessment(opp)
     reasons = []
     if opp.solo_feasibility:
         reasons.append(_truncate(opp.solo_feasibility, limit=140))
@@ -418,39 +859,87 @@ def _why_solo_buildable(opp: Opportunity) -> str:
         reasons.append(f"启动成本预估 {opp.startup_cost}")
     if opp.automation_rate:
         reasons.append(f"可自动化比例 {opp.automation_rate}")
+    if assessment.strengths:
+        reasons.extend(assessment.strengths[:2])
     if reasons:
         return '；'.join(reasons[:3]) + '。'
     return '先从人工服务 + 轻工具交付起步，单人也能在需求验证期内完成交付。'
 
 
-def _why_not_crushed(opp: Opportunity) -> str:
+def _why_not_crushed(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
+    assessment = assessment or _build_phase2_assessment(opp)
+    if assessment.frontline_hits:
+        names = '、'.join(assessment.frontline_hits[:2])
+        return f'目前并不存在明确的抗碾压逻辑。只要不把交付压缩成“{assessment.deliverable}”这种单结果，你就会回到和 {names} 正面拼功能的主战场。'
+    if assessment.crowded_hits:
+        category = assessment.category_label or assessment.crowded_hits[0]
+        return f'只有把交付压到“{assessment.deliverable}”这一单结果，才可能避开 {category} 的功能清单战争。'
     risk = _truncate(opp.risks, limit=120)
-    base = '这是一个窄切口工作流，先靠速度、人工兜底和深度场景理解收钱，通常不值得大玩家立刻下场复制。'
+    base = '这是一个足够窄的工作流，先靠速度、人工兜底和场景理解收钱，通常不值得大玩家立刻下场复制。'
     if risk:
-        return f"{base} 当前最需要防的不是巨头，而是 {risk}"
+        return f"{base} 当前最需要防的是 {risk}"
     return base
 
 
-def _smallest_paid_mvp(opp: Opportunity) -> str:
+def _smallest_paid_mvp(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
+    assessment = assessment or _build_phase2_assessment(opp)
     plan = _clean_text(opp.action_plan)
+    deliverable = assessment.deliverable or '一个单点结果'
+    target = assessment.target_user or '首批目标用户'
+    model = _clean_text(opp.revenue_model or '一次性服务费')
     if plan:
-        return f"最小收费版本应只承诺一个明确结果，先用表单/脚本/人工交付完成闭环。落地路径：{_truncate(plan, limit=180)}"
-    return '先做一个单入口、单输出、可人工兜底的收费 MVP，验证是否有人愿意为这一个结果付款。'
+        return f'先卖一个只交付“{deliverable}”的 {model} 试点，目标客户锁定为 {target}。落地路径：{_truncate(plan, limit=180)}'
+    return f'先卖一个只承诺“{deliverable}”的 {model} 试点，先用表单/脚本/人工兜底把首单交付出来。'
 
 
-def _filtered_reason(opp: Opportunity) -> str:
-    reasons = []
-    if opp.score < PHASE1_KEEP_MIN_SCORE:
-        reasons.append('未达到 Phase 1 保留阈值')
-    if not _is_fast_payback_window(opp.time_to_revenue):
-        reasons.append('14 天内收钱路径不够清晰')
-    if not _clean_text(opp.customer_acquisition):
-        reasons.append('前 20 个用户来源不够具体')
-    if not _clean_text(opp.solo_feasibility):
-        reasons.append('单人可交付边界不够明确')
-    if opp.risks:
-        reasons.append(f"主要风险：{_truncate(opp.risks, limit=80)}")
-    return '；'.join(reasons[:3]) if reasons else '当前更像泛机会，不是今天就该切进去的 wedge。'
+def _filtered_reason(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
+    assessment = assessment or _build_phase2_assessment(opp)
+    reasons = list(assessment.kill_reasons[:2])
+    if not reasons and assessment.keep_gaps:
+        reasons.append(assessment.keep_gaps[0])
+    if not reasons:
+        reasons.append('当前更像泛机会，不是今天就该切进去的 wedge。')
+    if len(reasons) < 2 and len(assessment.keep_gaps) > 1:
+        reasons.append(assessment.keep_gaps[1])
+    return ' '.join(reasons[:2])
+
+
+def _annotate_phase2_assessments(opportunities: List[Opportunity]) -> dict:
+    assessments = {}
+    for opp in opportunities:
+        assessment = _build_phase2_assessment(opp)
+        assessments[opp.id] = assessment
+        opp.phase2_adjusted_score = assessment.adjusted_score
+        opp.phase2_decision_label = _decision_label(assessment.adjusted_score, assessment.verdict)
+        opp.phase2_verdict = assessment.verdict
+        opp.phase2_wedge = _wedge_statement(opp, assessment)
+        opp.phase2_who_pays = _who_pays_in_14_days(opp, assessment)
+        opp.phase2_first_users = _first_20_users_source(opp, assessment)
+        opp.phase2_solo_logic = _why_solo_buildable(opp, assessment)
+        opp.phase2_not_crushed = _why_not_crushed(opp, assessment)
+        opp.phase2_paid_mvp = _smallest_paid_mvp(opp, assessment)
+        opp.phase2_filtered_reason = _filtered_reason(opp, assessment)
+        opp.phase2_raw_score = assessment.raw_score
+        opp.phase2_evidence_score = assessment.evidence_score
+        opp.score = assessment.adjusted_score
+    return assessments
+
+
+def _bucket_phase2_candidates(opportunities: List[Opportunity], assessments: Optional[dict] = None) -> tuple[List[Opportunity], List[Opportunity], List[Opportunity]]:
+    assessments = assessments or {opp.id: _build_phase2_assessment(opp) for opp in opportunities}
+    kept: List[Opportunity] = []
+    watchlist: List[Opportunity] = []
+    dropped: List[Opportunity] = []
+    for opp in opportunities:
+        assessment = assessments.get(opp.id)
+        verdict = assessment.verdict if assessment else 'drop'
+        if verdict == 'keep' and not kept:
+            kept.append(opp)
+        elif verdict == 'watch' and len(watchlist) < PHASE2_WATCH_LIMIT:
+            watchlist.append(opp)
+        elif verdict != 'keep' and len(dropped) < PHASE1_FILTER_LIMIT:
+            dropped.append(opp)
+    return kept, watchlist, dropped
 
 
 def _agent_reach_health_summary_lines() -> List[str]:
@@ -480,49 +969,59 @@ def _agent_reach_health_summary_lines() -> List[str]:
     return health_summary_lines
 
 
-def save_phase1_report(opportunities: List[Opportunity]):
+def save_phase1_report(opportunities: List[Opportunity], assessments: Optional[dict] = None, run_notes: Optional[List[str]] = None):
     """输出 Phase 1 solo-venture screener（markdown + latest）。"""
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
     report_file = os.path.join(DATA_DIR, f'phase1_report_{ts}.md')
     latest_file = os.path.join(DATA_DIR, 'latest_phase1.md')
 
-    kept, filtered = _select_phase1_candidates(opportunities)
+    assessments = assessments or {opp.id: _build_phase2_assessment(opp) for opp in opportunities}
+    kept, watchlist, dropped = _bucket_phase2_candidates(opportunities, assessments)
+    verdict_counts = {'keep': 0, 'watch': 0, 'drop': 0}
+    for opp in opportunities:
+        verdict = assessments[opp.id].verdict
+        verdict_counts[verdict] = verdict_counts.get(verdict, 0) + 1
     lines = [
         '# Phase 1 Solo Venture Screener',
         '',
         f'- 生成时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}',
         f'- 候选池规模: {len(opportunities)}',
         f'- 结论: {"Top1" if kept else "Top0"}',
+        f'- Verdict 分布: keep {verdict_counts["keep"]} / watch {verdict_counts["watch"]} / drop {verdict_counts["drop"]}',
         '',
     ]
     lines.extend(_agent_reach_health_summary_lines())
+    if run_notes:
+        lines.extend(['## Run Notes', *[f'- {note}' for note in run_notes], ''])
 
     if kept:
         opp = kept[0]
+        assessment = assessments[opp.id]
         lines.extend([
             '## Keep Candidate',
-            f'- 决策: **{_decision_label(opp.score)}**',
+            f'- 决策: **{_decision_label(opp.score, assessment.verdict)}**',
             f'- 等级: **{_score_grade(opp.score)}**',
+            f'- 筛选分: **{opp.score}/100**（原始 {assessment.raw_score}）',
             f'- 来源: `{opp.source}`',
             f'- 链接: {opp.url}',
             '',
             '### Wedge / 切入点',
-            _wedge_statement(opp),
+            _wedge_statement(opp, assessment),
             '',
             '### 谁会在 14 天内付钱',
-            _who_pays_in_14_days(opp),
+            _who_pays_in_14_days(opp, assessment),
             '',
             '### 前 20 个用户从哪里来',
-            _first_20_users_source(opp),
+            _first_20_users_source(opp, assessment),
             '',
             '### 为什么适合 solo builder',
-            _why_solo_buildable(opp),
+            _why_solo_buildable(opp, assessment),
             '',
             '### 为什么不会立刻被大玩家碾压',
-            _why_not_crushed(opp),
+            _why_not_crushed(opp, assessment),
             '',
             '### 最小可收费 MVP',
-            _smallest_paid_mvp(opp),
+            _smallest_paid_mvp(opp, assessment),
             '',
             '### 备注',
             f'- 变现方式: {opp.revenue_model or "待验证"}',
@@ -532,12 +1031,38 @@ def save_phase1_report(opportunities: List[Opportunity]):
             '',
         ])
     else:
+        top_gap_lines = []
+        for opp in dropped[:2]:
+            reason = _filtered_reason(opp, assessments.get(opp.id))
+            if reason:
+                top_gap_lines.append(f'- {opp.title}: {reason}')
         lines.extend([
             '## Top0',
-            '今天没有候选通过 Phase 1 保留门槛。',
-            '主要原因通常是 14 天内付费路径、前 20 个用户来源或单人可交付边界不够清晰。',
+            '今天没有候选通过 Phase 2 保留门槛。',
+            '主要问题不是分数不够高，而是没有出现一个同时满足“14 天可收钱 + 首批用户名单明确 + 不正面撞大厂主战场”的切口。',
             '',
         ])
+        lines.extend(top_gap_lines)
+        if top_gap_lines:
+            lines.append('')
+
+    if watchlist:
+        lines.extend([
+            '## Watchlist',
+            '以下机会有局部信号，但证据还不够硬，本轮不进入 wedge 验证：',
+            '',
+        ])
+        for idx, opp in enumerate(watchlist, 1):
+            assessment = assessments[opp.id]
+            lines.extend([
+                f'### {idx}. {opp.title}',
+                f'- 决策: **{_decision_label(opp.score, assessment.verdict)}**',
+                f'- 等级: **{_score_grade(opp.score)}**',
+                f'- 理由: {_filtered_reason(opp, assessment)}',
+                f'- 可继续跟进: {_wedge_statement(opp, assessment)}',
+                f'- 链接: {opp.url}',
+                '',
+            ])
 
     lines.extend([
         '## Not Worth Doing Now',
@@ -545,14 +1070,16 @@ def save_phase1_report(opportunities: List[Opportunity]):
         '',
     ])
 
-    if filtered:
-        for idx, opp in enumerate(filtered, 1):
+    if dropped:
+        for idx, opp in enumerate(dropped, 1):
+            assessment = assessments[opp.id]
             lines.extend([
                 f'### {idx}. {opp.title}',
-                f'- 决策: **{_decision_label(opp.score)}**',
+                f'- 决策: **{_decision_label(opp.score, assessment.verdict)}**',
                 f'- 等级: **{_score_grade(opp.score)}**',
+                f'- 筛选分: **{opp.score}/100**（原始 {assessment.raw_score}）',
                 f'- 来源: `{opp.source}`',
-                f'- 理由: {_filtered_reason(opp)}',
+                f'- 理由: {_filtered_reason(opp, assessment)}',
                 f'- 链接: {opp.url}',
                 '',
             ])
@@ -675,6 +1202,16 @@ def _resolve_feishu_credentials() -> tuple[Optional[str], Optional[str]]:
     except Exception:
         pass
     return app_id, app_secret
+
+
+def _sanitize_secret_text(text: str, secrets: List[str]) -> str:
+    sanitized = text or ''
+    for secret in secrets:
+        if secret:
+            sanitized = sanitized.replace(secret, '***')
+    sanitized = re.sub(r'("app_id":"?)[^",\s]+', r'\1***', sanitized)
+    sanitized = re.sub(r'("app_secret":"?)[^",\s]+', r'\1***', sanitized)
+    return sanitized
 
 
 def sync_report_to_feishu(md_filename: str = 'latest_phase1.md', title: Optional[str] = None) -> Optional[str]:
@@ -859,6 +1396,7 @@ async function insertUnderDocList(docToken, lineMarkdown) {
             env=env,
         )
         out = (result.stdout or '').strip() or (result.stderr or '').strip()
+        out = _sanitize_secret_text(out, [app_id or '', app_secret or ''])
         url = _extract_real_feishu_doc_url(out)
         if result.returncode == 0 and url:
             print(f'Feishu daily doc: {url}')
@@ -1108,30 +1646,45 @@ def generate_mvps(opportunities: List[Opportunity]):
     print(f"\n✅ Generated {generated}/{len(opportunities[:2])} MVPs")
 
 
-def print_phase1_results(kept: List[Opportunity], filtered: List[Opportunity], total_count: int):
+def print_phase1_results(kept: List[Opportunity], watchlist: List[Opportunity], dropped: List[Opportunity], total_count: int, assessments: Optional[dict] = None):
     """打印 Phase 1 screener 摘要。"""
+    assessments = assessments or {}
     print("\n" + "=" * 80)
     print(f"Phase 1 Solo Venture Screener | 候选池 {total_count} 条")
     print("=" * 80 + "\n")
 
     if kept:
         opp = kept[0]
-        print(f"Top1 | {_decision_label(opp.score)} | 等级 { _score_grade(opp.score) }")
-        print(f"切入 wedge：{_wedge_statement(opp)}")
-        print(f"14 天收钱：{_who_pays_in_14_days(opp)}")
-        print(f"前 20 个用户：{_first_20_users_source(opp)}")
-        print(f"Solo 可行性：{_why_solo_buildable(opp)}")
-        print(f"抗巨头逻辑：{_why_not_crushed(opp)}")
-        print(f"最小收费 MVP：{_smallest_paid_mvp(opp)}")
+        assessment = assessments.get(opp.id)
+        print(f"Top1 | {_decision_label(opp.score, assessment.verdict if assessment else None)} | 等级 { _score_grade(opp.score) }")
+        print(f"切入 wedge：{_wedge_statement(opp, assessment)}")
+        print(f"14 天收钱：{_who_pays_in_14_days(opp, assessment)}")
+        print(f"前 20 个用户：{_first_20_users_source(opp, assessment)}")
+        print(f"Solo 可行性：{_why_solo_buildable(opp, assessment)}")
+        print(f"抗巨头逻辑：{_why_not_crushed(opp, assessment)}")
+        print(f"最小收费 MVP：{_smallest_paid_mvp(opp, assessment)}")
         print(f"链接：{opp.url}")
     else:
-        print("Top0 | 今天没有候选通过 Phase 1 保留门槛")
+        print("Top0 | 今天没有候选通过 Phase 2 保留门槛")
+        for opp in dropped[:2]:
+            assessment = assessments.get(opp.id)
+            print(f"- {opp.title}：{_filtered_reason(opp, assessment)}")
+
+    if watchlist:
+        print("\nWatchlist：")
+        for idx, opp in enumerate(watchlist, 1):
+            assessment = assessments.get(opp.id)
+            verdict = assessment.verdict if assessment else None
+            print(f"{idx}. {_decision_label(opp.score, verdict)} | 等级 {_score_grade(opp.score)} | {opp.title}")
+            print(f"   {_filtered_reason(opp, assessment)}")
 
     print("\n过滤样本：")
-    if filtered:
-        for idx, opp in enumerate(filtered, 1):
-            print(f"{idx}. {_decision_label(opp.score)} | 等级 {_score_grade(opp.score)} | {opp.title}")
-            print(f"   {_filtered_reason(opp)}")
+    if dropped:
+        for idx, opp in enumerate(dropped, 1):
+            assessment = assessments.get(opp.id)
+            verdict = assessment.verdict if assessment else None
+            print(f"{idx}. {_decision_label(opp.score, verdict)} | 等级 {_score_grade(opp.score)} | {opp.title}")
+            print(f"   {_filtered_reason(opp, assessment)}")
     else:
         print("无更多可列出的过滤样本")
     print()
@@ -1174,6 +1727,17 @@ def print_results(opportunities: List[Opportunity]):
             print(f"   - {link}")
         print()
         print("-"*80 + "\n")
+
+
+def _finalize_top0_run(reason: str):
+    save_phase1_report([], {}, run_notes=[reason])
+    feishu_doc_url = sync_report_to_feishu()
+    print_phase1_results([], [], [], 0, {})
+    if feishu_doc_url:
+        print(f"Verified Feishu doc URL: {feishu_doc_url}")
+    print("No kept candidate to send via direct Feishu message")
+    print("GitHub issue creation disabled in Phase 1; use --enable-github-issues to override")
+    print("MVP generation disabled in Phase 1; use --enable-mvp-generation to override")
 
 
 def main():
@@ -1252,15 +1816,17 @@ def main():
 
         if not opportunities:
             print("本次机会均与近14天重复，已全部过滤")
+            _finalize_top0_run("本次命中的机会与近 14 天重复，未产生新的 Top1/Watchlist。")
             return
 
-        opportunities = rerank_for_solo(opportunities)
-        kept_candidates, filtered_candidates = _select_phase1_candidates(opportunities)
+        assessments = _annotate_phase2_assessments(opportunities)
+        opportunities = rerank_for_solo(opportunities, assessments)
+        kept_candidates, watch_candidates, dropped_candidates = _bucket_phase2_candidates(opportunities, assessments)
 
         save_results(opportunities)
-        save_phase1_report(opportunities)
+        save_phase1_report(opportunities, assessments)
         feishu_doc_url = sync_report_to_feishu()
-        print_phase1_results(kept_candidates, filtered_candidates, len(opportunities))
+        print_phase1_results(kept_candidates, watch_candidates, dropped_candidates, len(opportunities), assessments)
         if feishu_doc_url:
             print(f"Verified Feishu doc URL: {feishu_doc_url}")
         if kept_candidates:
@@ -1279,6 +1845,7 @@ def main():
             print("MVP generation disabled in Phase 1; use --enable-mvp-generation to override")
     else:
         print("未发现符合条件的机会")
+        _finalize_top0_run("本次采集或分析未产出可排序候选；已输出 Top0 报告供后续排查。")
 
 
 if __name__ == "__main__":
