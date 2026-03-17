@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""Feishu integration: credential resolution, doc sync, and direct messaging via OpenClaw CLI."""
+"""飞书集成 -- 文档同步和消息推送"""
 
 import os
-import json
 import re
+import json
 import subprocess
 import tempfile
 import shutil
 from datetime import datetime
 from typing import List, Optional
 
-from config import FEISHU_APP_ID, FEISHU_APP_SECRET, FEISHU_USER_ID, FEISHU_INDEX_DOC_TOKEN, FEISHU_DOC_SYNC_ENABLED, DATA_DIR
+from config import (
+    DATA_DIR, FEISHU_APP_ID, FEISHU_APP_SECRET,
+    FEISHU_USER_ID, FEISHU_INDEX_DOC_TOKEN, FEISHU_DOC_SYNC_ENABLED,
+)
 from models.opportunity import Opportunity
 
 
@@ -319,11 +322,7 @@ def sync_top10_report_to_feishu() -> Optional[str]:
 
 
 def send_to_feishu(opportunities: List[Opportunity]):
-    """发送到飞书（通过 OpenClaw CLI）
-
-    修复点：某些环境下 openclaw 会输出 config warnings，
-    但消息实际已发送。这里用"返回码 + 输出特征"双判定，避免误报失败。
-    """
+    """发送到飞书（通过 OpenClaw CLI）"""
     if not FEISHU_USER_ID:
         print("FEISHU_USER_ID not configured, skipping Feishu notification")
         return
@@ -333,19 +332,10 @@ def send_to_feishu(opportunities: List[Opportunity]):
 
     def _looks_delivered(stdout: str, stderr: str) -> bool:
         text = f"{stdout}\n{stderr}".lower()
-        success_signals = [
-            '"messageid"',
-            '"chatid"',
-            ' via ',
-            'result',
-            'sent',
-            'delivered',
-        ]
+        success_signals = ['"messageid"', '"chatid"', ' via ', 'result', 'sent', 'delivered']
         return any(sig in text for sig in success_signals)
 
     try:
-        import subprocess
-
         sent = 0
         failed = 0
 
@@ -365,15 +355,15 @@ def send_to_feishu(opportunities: List[Opportunity]):
             if delivered:
                 sent += 1
                 if result.returncode != 0:
-                    print(f"✅ Sent to Feishu (with warnings): {opp.title[:50]}...")
+                    print(f"Sent to Feishu (with warnings): {opp.title[:50]}...")
                 else:
-                    print(f"✅ Sent to Feishu: {opp.title[:50]}...")
+                    print(f"Sent to Feishu: {opp.title[:50]}...")
             else:
                 failed += 1
                 err = (result.stderr or result.stdout or '').strip().replace('\n', ' ')
-                print(f"⚠️  Send failed: {err[:160]}")
+                print(f"Send failed: {err[:160]}")
 
-        print(f"✅ Feishu delivery summary: sent={sent}, failed={failed}, total={min(10, len(opportunities))}")
+        print(f"Feishu delivery summary: sent={sent}, failed={failed}, total={min(10, len(opportunities))}")
 
     except Exception as e:
         print(f"Error sending to Feishu: {e}")
