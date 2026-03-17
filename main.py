@@ -433,6 +433,23 @@ PHASE2_SIGNAL_WEAK_TERMS = ['融资', 'funding', 'launch', 'show hn', 'how i', '
 PHASE2_PLATFORM_DEPENDENCY_TERMS = ['api变更', 'api 变更', '官方', '自带', '依赖单一', '单一平台', 'policy', 'policies', '平台策略']
 PHASE2_GENERIC_PLAN_TERMS = ['先做mvp', '先做 MVP', '根据反馈迭代', '再迭代', '验证需求', '上线看看', '先上线', 'build mvp', 'iterate', 'launch on product hunt']
 PHASE2_CONCRETE_PLAN_TERMS = ['试点', '审计', '脚本', '人工', '报价', '收取', '收费', '外联', '迁移', '报告', '清单', '访谈', '名单', 'pilot', 'audit', 'migration', 'report']
+PHASE2_CONCRETE_DELIVERABLE_TERMS = ['审计', '报告', '清单', '脚本', '迁移', 'migration', 'report', 'audit', 'playbook', '摘要', '诊断', '回复建议', 'review', 'checklist', '试点', 'pilot']
+PHASE2_GENERIC_WEDGE_TERMS = ['tool', 'tools', 'platform', 'assistant', 'copilot', 'workspace', 'system', '产品', '工具', '平台', '系统', '应用']
+PHASE2_TRIGGER_HINTS = [
+    (('refund', '退款', 'chargeback', '高风险订单'), '出现退款争议、退款滥用或高风险订单时'),
+    (('failed payment', '支付失败', '扣款失败'), 'failed payment 开始堆积时'),
+    (('churn', '流失'), '流失率抬头时'),
+    (('support', '客服', 'ticket', '工单'), '工单积压或回复超时时'),
+    (('migration', '迁移'), '准备做迁移或切换栈时'),
+    (('playbook', '评审清单', '代码库'), '团队准备把 AI 编程流程落进真实代码库时'),
+]
+PHASE2_DELIVERABLE_HINTS = [
+    (('refund', '退款', 'chargeback'), '一份退款滥用审计报告'),
+    (('failed payment', '支付失败', '扣款失败'), '一份 failed payment 与流失诊断报告'),
+    (('support', '客服', 'ticket', '工单'), '一份工单分流与回复建议清单'),
+    (('migration', '迁移'), '一个单一框架迁移包'),
+    (('playbook', '评审清单', '代码库'), '一份基于真实代码库的 AI 编程评审清单与 playbook'),
+]
 
 
 def _score_grade(score: int) -> str:
@@ -443,6 +460,16 @@ def _score_grade(score: int) -> str:
     if score >= 68:
         return 'C'
     return 'D'
+
+
+def _signal_strength_label(score: int) -> str:
+    mapping = {
+        'A': '高',
+        'B': '中高',
+        'C': '待验证',
+        'D': '弱',
+    }
+    return mapping[_score_grade(score)]
 
 
 def _decision_label(score: int, verdict: Optional[str] = None) -> str:
@@ -510,7 +537,64 @@ def _pick_phase2_profile(text_lower: str) -> Optional[dict]:
         if score > best_score:
             best = profile
             best_score = score
-    return best if best_score > 0 else None
+    return best if best_score >= 2 else None
+
+
+def _extract_specific_phrase(text: str, patterns: List[str], limit: int = 72) -> str:
+    haystack = _clean_text(text)
+    if not haystack:
+        return ''
+    for pattern in patterns:
+        match = re.search(pattern, haystack, re.IGNORECASE)
+        if not match:
+            continue
+        candidate = _clean_text(match.group(1))
+        candidate = re.sub(r'^(?:一版|一个|一份|一次|每周一次的|每周|一周内交付的|只交付|只卖|针对|面向)\s*', '', candidate, flags=re.IGNORECASE)
+        candidate = re.sub(r'^[的\s]+', '', candidate)
+        candidate = re.sub(r'[，。；,:：]+$', '', candidate)
+        candidate = _truncate(candidate, limit=limit)
+        if candidate:
+            return candidate
+    return ''
+
+
+def _looks_specific_deliverable(text: str) -> bool:
+    normalized = _clean_text(text).lower()
+    if not normalized:
+        return False
+    if any(term in normalized for term in PHASE2_GENERIC_WEDGE_TERMS):
+        return False
+    return any(term in normalized for term in PHASE2_CONCRETE_DELIVERABLE_TERMS)
+
+
+def _extract_trigger_candidate(opp: Opportunity) -> str:
+    _, text_lower = _combined_signal_text(opp)
+    for keywords, trigger in PHASE2_TRIGGER_HINTS:
+        if any(keyword in text_lower for keyword in keywords):
+            return trigger
+    return ''
+
+
+def _extract_deliverable_candidate(opp: Opportunity) -> str:
+    haystacks = [
+        opp.action_plan or '',
+        opp.description or '',
+        opp.summary or '',
+    ]
+    patterns = [
+        r'(?:先卖|先做|先交付|先提供|交付|提供|输出)(?:一版|一个|一份|一次|每周一次的|每周|一周内交付的|只交付|只卖)?([^，。；\n]{6,80})',
+        r'(?:卖|收取)[^，。；\n]{0,16}(?:的)?([^，。；\n]{6,80}(?:报告|审计|清单|脚本|迁移包|playbook|pilot|试点|诊断|摘要|方案))',
+    ]
+    for text in haystacks:
+        candidate = _extract_specific_phrase(text, patterns)
+        if candidate and _looks_specific_deliverable(candidate):
+            return candidate
+
+    _, text_lower = _combined_signal_text(opp)
+    for keywords, deliverable in PHASE2_DELIVERABLE_HINTS:
+        if any(keyword in text_lower for keyword in keywords):
+            return deliverable
+    return ''
 
 
 def _extract_target_user(opp: Opportunity, profile: Optional[dict]) -> str:
@@ -605,8 +689,10 @@ def _build_phase2_assessment(opp: Opportunity) -> ScreeningAssessment:
     _, text_lower = _combined_signal_text(opp)
     profile = _pick_phase2_profile(text_lower)
     target_user = _extract_target_user(opp, profile)
-    trigger_event = profile['trigger'] if profile else '用户最着急解决这个问题时'
-    deliverable = profile['deliverable'] if profile else '一个单点可收费结果'
+    trigger_candidate = _extract_trigger_candidate(opp)
+    deliverable_candidate = _extract_deliverable_candidate(opp)
+    trigger_event = trigger_candidate or (profile['trigger'] if profile else '用户最着急解决这个问题时')
+    deliverable = deliverable_candidate or (profile['deliverable'] if profile else '一个单点可收费结果')
     avoid_label = profile['avoid_label'] if profile else f'一个泛化复制“{opp.title}”的产品'
     first_users_hint = profile['first_users_hint'] if profile else ''
 
@@ -644,7 +730,11 @@ def _build_phase2_assessment(opp: Opportunity) -> ScreeningAssessment:
         keep_gaps.append('首批用户来源还停留在泛渠道词，没有变成可执行名单')
         adjusted_score -= 9
 
-    if profile:
+    if deliverable_candidate or trigger_candidate:
+        evidence_score += 1
+        adjusted_score += 4
+        strengths.append(f'切口已经压到“{_truncate(deliverable, limit=36)}”这类可收费结果')
+    elif profile:
         evidence_score += 1
         adjusted_score += 3
         strengths.append(f'目标切口至少落在“{profile["category_label"]}”这个具体工作流上')
@@ -734,6 +824,19 @@ def _build_phase2_assessment(opp: Opportunity) -> ScreeningAssessment:
         adjusted_score -= 8
         keep_gaps.append('叙述里还是平台/全家桶语言，没有压缩到单结果交付')
 
+    fast_payback = _is_fast_payback_window(opp.time_to_revenue)
+    generic_action_plan = _is_generic_action_plan(opp.action_plan)
+    weak_source_signal = bool(weak_signal_hits) and source in {'hn', 'ph', 'indiehackers', '36kr', 'huxiu'}
+    hard_filter_reasons: List[str] = []
+    if heavy_delivery_hits:
+        hard_filter_reasons.append('交付仍偏重实施/集成，单人模型会被服务化吞掉。')
+    if crowded_hits and frontline_hits:
+        hard_filter_reasons.append('切口仍落在大厂和成熟产品的主战场。')
+    if acquisition_level == 0 and generic_action_plan:
+        hard_filter_reasons.append('首客名单和首单动作都还是模板话，缺少可执行验证路径。')
+    if weak_source_signal and not fast_payback and acquisition_level < 2:
+        hard_filter_reasons.append('信号更像内容/案例热度，不像前线用户在催首单交付。')
+
     adjusted_score = max(0, min(95, adjusted_score))
 
     if crowded_hits and frontline_hits:
@@ -753,23 +856,31 @@ def _build_phase2_assessment(opp: Opportunity) -> ScreeningAssessment:
 
     if keep_gaps and not _is_fast_payback_window(opp.time_to_revenue):
         kill_reasons.append('现在更多是“有人会讨论/会注册”，不是“有人会在 14 天内掏钱催你交付”。')
+    kill_reasons.extend(hard_filter_reasons[:2])
 
     critical_red_flags = bool(heavy_delivery_hits) or (bool(crowded_hits) and bool(frontline_hits))
     if (
         adjusted_score >= PHASE2_KEEP_MIN_SCORE
         and evidence_score >= 5
-        and _is_fast_payback_window(opp.time_to_revenue)
+        and fast_payback
         and acquisition_level >= 2
-        and not _is_generic_action_plan(opp.action_plan)
+        and not generic_action_plan
+        and (profile or deliverable_candidate or trigger_candidate)
         and not critical_red_flags
+        and not hard_filter_reasons
     ):
         verdict = 'keep'
     elif (
         adjusted_score >= PHASE2_WATCH_MIN_SCORE
-        and evidence_score >= 3
-        and not heavy_delivery_hits
+        and evidence_score >= 4
+        and acquisition_level >= 1
+        and not generic_action_plan
+        and (profile or deliverable_candidate or trigger_candidate)
+        and not critical_red_flags
+        and not weak_source_signal
         and len(crowded_hits) <= 1
         and len(frontline_hits) <= 1
+        and not hard_filter_reasons
     ):
         verdict = 'watch'
     else:
@@ -824,10 +935,44 @@ def _wedge_statement(opp: Opportunity, assessment: Optional[ScreeningAssessment]
     target = assessment.target_user or '一小撮已经在手工兜底的人'
     trigger = assessment.trigger_event or '用户最着急解决问题时'
     deliverable = assessment.deliverable or '一个单点可收费结果'
-    prefix = f'别做{assessment.avoid_label}，先切「{target}在{trigger}要拿到{deliverable}」这一刀'
+    prefix = f'{target}在{trigger}，先为他们交付“{deliverable}”'
     if assessment.verdict == 'keep':
-        return prefix + '，先用脚本 + 人工兜底把这一个结果卖出去。'
-    return prefix + '。但当前证据还不够证明这刀能在 14 天内先收钱。'
+        return f'别做{assessment.avoid_label}，先盯住这一个结果：{prefix}；先用脚本 + 人工兜底把首单卖出去。'
+    if assessment.verdict == 'watch':
+        return f'如果继续跟进，只验证这一刀是否成立：{prefix}。在证据更硬之前，不要扩成{assessment.avoid_label}。'
+    return f'除非能先证明 {prefix}愿意付钱，否则别做{assessment.avoid_label}。'
+
+
+def _phase2_evidence_label(assessment: ScreeningAssessment) -> str:
+    if assessment.verdict == 'keep' or assessment.evidence_score >= 5:
+        return '硬证据较强'
+    if assessment.evidence_score >= 4:
+        return '证据中等'
+    if assessment.evidence_score >= 2:
+        return '证据偏弱'
+    return '证据不足'
+
+
+def _phase2_signal_summary(opp: Opportunity, assessment: ScreeningAssessment) -> str:
+    parts = [_phase2_evidence_label(assessment)]
+    if _is_fast_payback_window(opp.time_to_revenue):
+        parts.append('14 天收钱窗口明确')
+    else:
+        parts.append('14 天收钱窗口不足')
+
+    acquisition_level = _acquisition_specificity_level(opp.customer_acquisition)
+    if acquisition_level >= 2:
+        parts.append('首客名单明确')
+    elif acquisition_level == 1:
+        parts.append('首客名单只有方向')
+    else:
+        parts.append('首客名单缺失')
+
+    if _is_generic_action_plan(opp.action_plan):
+        parts.append('首单动作仍模板化')
+    else:
+        parts.append('首单动作具体')
+    return ' / '.join(parts)
 
 
 def _who_pays_in_14_days(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
@@ -986,8 +1131,8 @@ def save_phase1_report(opportunities: List[Opportunity], assessments: Optional[d
         '',
         f'- 生成时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}',
         f'- 候选池规模: {len(opportunities)}',
-        f'- 结论: {"Top1" if kept else "Top0"}',
-        f'- Verdict 分布: keep {verdict_counts["keep"]} / watch {verdict_counts["watch"]} / drop {verdict_counts["drop"]}',
+        f'- 结论: {"今日建议推进 1 个切口" if kept else "今日没有值得立刻开工的切口"}',
+        f'- 决策分布: keep {verdict_counts["keep"]} / watch {verdict_counts["watch"]} / drop {verdict_counts["drop"]}',
         '',
     ]
     lines.extend(_agent_reach_health_summary_lines())
@@ -998,10 +1143,11 @@ def save_phase1_report(opportunities: List[Opportunity], assessments: Optional[d
         opp = kept[0]
         assessment = assessments[opp.id]
         lines.extend([
-            '## Keep Candidate',
-            f'- 决策: **{_decision_label(opp.score, assessment.verdict)}**',
-            f'- 等级: **{_score_grade(opp.score)}**',
-            f'- 筛选分: **{opp.score}/100**（原始 {assessment.raw_score}）',
+            '## Recommended Bet',
+            '这是今天最值得 founder 亲自下场验证的切口。',
+            f'- 建议动作: **{_decision_label(opp.score, assessment.verdict)}**',
+            f'- 机会信号: **{_signal_strength_label(opp.score)}**',
+            f'- 证据摘要: **{_phase2_signal_summary(opp, assessment)}**',
             f'- 来源: `{opp.source}`',
             f'- 链接: {opp.url}',
             '',
@@ -1037,9 +1183,9 @@ def save_phase1_report(opportunities: List[Opportunity], assessments: Optional[d
             if reason:
                 top_gap_lines.append(f'- {opp.title}: {reason}')
         lines.extend([
-            '## Top0',
-            '今天没有候选通过 Phase 2 保留门槛。',
-            '主要问题不是分数不够高，而是没有出现一个同时满足“14 天可收钱 + 首批用户名单明确 + 不正面撞大厂主战场”的切口。',
+            '## No Bet Today',
+            '今天没有出现值得 founder 立刻投入验证周期的切口。',
+            '缺的不是更高的分数，而是一个同时满足“14 天可收钱 + 首批用户名单明确 + 不正面撞大厂主战场”的切口。',
             '',
         ])
         lines.extend(top_gap_lines)
@@ -1048,25 +1194,26 @@ def save_phase1_report(opportunities: List[Opportunity], assessments: Optional[d
 
     if watchlist:
         lines.extend([
-            '## Watchlist',
-            '以下机会有局部信号，但证据还不够硬，本轮不进入 wedge 验证：',
+            '## Keep Warm',
+            '以下机会有局部信号，但证据还不够硬，本轮不投入 builder 周期：',
             '',
         ])
         for idx, opp in enumerate(watchlist, 1):
             assessment = assessments[opp.id]
             lines.extend([
                 f'### {idx}. {opp.title}',
-                f'- 决策: **{_decision_label(opp.score, assessment.verdict)}**',
-                f'- 等级: **{_score_grade(opp.score)}**',
-                f'- 理由: {_filtered_reason(opp, assessment)}',
-                f'- 可继续跟进: {_wedge_statement(opp, assessment)}',
+                f'- 当前建议: **{_decision_label(opp.score, assessment.verdict)}**',
+                f'- 机会信号: **{_signal_strength_label(opp.score)}**',
+                f'- 证据摘要: {_phase2_signal_summary(opp, assessment)}',
+                f'- 先不推进原因: {_filtered_reason(opp, assessment)}',
+                f'- 如果继续跟进，建议切口: {_wedge_statement(opp, assessment)}',
                 f'- 链接: {opp.url}',
                 '',
             ])
 
     lines.extend([
-        '## Not Worth Doing Now',
-        '以下条目保留作样本，但不进入本轮 wedge 验证：',
+        '## Pass For Now',
+        '以下条目保留作市场样本，但本轮不建议投入产品验证资源：',
         '',
     ])
 
@@ -1075,11 +1222,11 @@ def save_phase1_report(opportunities: List[Opportunity], assessments: Optional[d
             assessment = assessments[opp.id]
             lines.extend([
                 f'### {idx}. {opp.title}',
-                f'- 决策: **{_decision_label(opp.score, assessment.verdict)}**',
-                f'- 等级: **{_score_grade(opp.score)}**',
-                f'- 筛选分: **{opp.score}/100**（原始 {assessment.raw_score}）',
+                f'- 当前建议: **{_decision_label(opp.score, assessment.verdict)}**',
+                f'- 机会信号: **{_signal_strength_label(opp.score)}**',
+                f'- 证据摘要: {_phase2_signal_summary(opp, assessment)}',
                 f'- 来源: `{opp.source}`',
-                f'- 理由: {_filtered_reason(opp, assessment)}',
+                f'- 暂缓原因: {_filtered_reason(opp, assessment)}',
                 f'- 链接: {opp.url}',
                 '',
             ])
@@ -1143,7 +1290,8 @@ def save_top10_report(opportunities: List[Opportunity]):
     for idx, o in enumerate(top, 1):
         lines += [
             f'## {idx}. {o.title}',
-            f'- 评分: **{o.score}/100**',
+            f'- 机会信号: **{_signal_strength_label(o.display_score())}**',
+            f'- 建议动作: **{o.decision_label()}**',
             f'- 来源: `{o.source}`',
             f'- 链接: {o.url}',
             '',
@@ -1214,6 +1362,46 @@ def _sanitize_secret_text(text: str, secrets: List[str]) -> str:
     return sanitized
 
 
+def _resolve_feishu_runtime() -> tuple[Optional[str], Optional[str], Optional[str]]:
+    node_candidates = []
+    detected_node = shutil.which('node')
+    if detected_node:
+        node_candidates.append(detected_node)
+    node_candidates.extend(['/opt/homebrew/bin/node', '/usr/local/bin/node'])
+
+    node_bin = next((path for path in node_candidates if path and os.path.exists(path)), None)
+    if not node_bin:
+        return None, None, 'node runtime not found; install Node.js or add node to PATH'
+
+    roots: List[str] = []
+    existing_node_path = os.environ.get('NODE_PATH', '')
+    if existing_node_path:
+        roots.extend([p.strip() for p in existing_node_path.split(os.pathsep) if p.strip()])
+
+    openclaw_bin = shutil.which('openclaw')
+    if openclaw_bin:
+        package_root = os.path.dirname(os.path.realpath(openclaw_bin))
+        roots.append(os.path.join(package_root, 'node_modules'))
+
+    roots.extend([
+        '/opt/homebrew/lib/node_modules/openclaw/node_modules',
+        '/usr/local/lib/node_modules/openclaw/node_modules',
+    ])
+
+    checked = []
+    seen = set()
+    for root in roots:
+        if root in seen:
+            continue
+        seen.add(root)
+        checked.append(root)
+        if os.path.exists(os.path.join(root, '@larksuiteoapi', 'node-sdk')):
+            return node_bin, root, None
+
+    checked_text = ', '.join(checked) if checked else '(none)'
+    return node_bin, None, f'@larksuiteoapi/node-sdk not found; checked NODE_PATH candidates: {checked_text}'
+
+
 def sync_report_to_feishu(md_filename: str = 'latest_phase1.md', title: Optional[str] = None) -> Optional[str]:
     """将指定 markdown 报告同步到 Feishu Doc，并返回可验证的真实 docx URL。"""
     if not FEISHU_DOC_SYNC_ENABLED:
@@ -1230,6 +1418,10 @@ def sync_report_to_feishu(md_filename: str = 'latest_phase1.md', title: Optional
         return None
 
     title = title or f"Solo Venture Screener-{datetime.now().strftime('%Y-%m-%d')}"
+    node_bin, node_path, runtime_error = _resolve_feishu_runtime()
+    if runtime_error:
+        print(f"Feishu doc sync unavailable: {runtime_error}")
+        return None
 
     node_script = r'''
 const fs = require('fs');
@@ -1384,10 +1576,7 @@ async function insertUnderDocList(docToken, lineMarkdown) {
             'FEISHU_MD_PATH': md_path,
         })
 
-        npm_root = '/opt/homebrew/lib/node_modules/openclaw/node_modules'
-        env['NODE_PATH'] = f"{npm_root}:{env.get('NODE_PATH', '')}" if env.get('NODE_PATH') else npm_root
-
-        node_bin = shutil.which('node') or '/opt/homebrew/bin/node'
+        env['NODE_PATH'] = f"{node_path}:{env.get('NODE_PATH', '')}" if env.get('NODE_PATH') else node_path
         result = subprocess.run(
             [node_bin, script_path],
             capture_output=True,
@@ -1656,7 +1845,9 @@ def print_phase1_results(kept: List[Opportunity], watchlist: List[Opportunity], 
     if kept:
         opp = kept[0]
         assessment = assessments.get(opp.id)
-        print(f"Top1 | {_decision_label(opp.score, assessment.verdict if assessment else None)} | 等级 { _score_grade(opp.score) }")
+        print(f"Recommended Bet | {_decision_label(opp.score, assessment.verdict if assessment else None)} | 信号 {_signal_strength_label(opp.score)}")
+        if assessment:
+            print(f"证据摘要：{_phase2_signal_summary(opp, assessment)}")
         print(f"切入 wedge：{_wedge_statement(opp, assessment)}")
         print(f"14 天收钱：{_who_pays_in_14_days(opp, assessment)}")
         print(f"前 20 个用户：{_first_20_users_source(opp, assessment)}")
@@ -1665,25 +1856,29 @@ def print_phase1_results(kept: List[Opportunity], watchlist: List[Opportunity], 
         print(f"最小收费 MVP：{_smallest_paid_mvp(opp, assessment)}")
         print(f"链接：{opp.url}")
     else:
-        print("Top0 | 今天没有候选通过 Phase 2 保留门槛")
+        print("No Bet Today | 今天没有值得立刻开工的切口")
         for opp in dropped[:2]:
             assessment = assessments.get(opp.id)
             print(f"- {opp.title}：{_filtered_reason(opp, assessment)}")
 
     if watchlist:
-        print("\nWatchlist：")
+        print("\nKeep Warm：")
         for idx, opp in enumerate(watchlist, 1):
             assessment = assessments.get(opp.id)
             verdict = assessment.verdict if assessment else None
-            print(f"{idx}. {_decision_label(opp.score, verdict)} | 等级 {_score_grade(opp.score)} | {opp.title}")
+            summary = _phase2_signal_summary(opp, assessment) if assessment else '证据待补充'
+            print(f"{idx}. {_decision_label(opp.score, verdict)} | 信号 {_signal_strength_label(opp.score)} | {opp.title}")
+            print(f"   {summary}")
             print(f"   {_filtered_reason(opp, assessment)}")
 
-    print("\n过滤样本：")
+    print("\nPass For Now：")
     if dropped:
         for idx, opp in enumerate(dropped, 1):
             assessment = assessments.get(opp.id)
             verdict = assessment.verdict if assessment else None
-            print(f"{idx}. {_decision_label(opp.score, verdict)} | 等级 {_score_grade(opp.score)} | {opp.title}")
+            summary = _phase2_signal_summary(opp, assessment) if assessment else '证据待补充'
+            print(f"{idx}. {_decision_label(opp.score, verdict)} | 信号 {_signal_strength_label(opp.score)} | {opp.title}")
+            print(f"   {summary}")
             print(f"   {_filtered_reason(opp, assessment)}")
     else:
         print("无更多可列出的过滤样本")
@@ -1697,7 +1892,7 @@ def print_results(opportunities: List[Opportunity]):
     print("="*80 + "\n")
     
     for i, opp in enumerate(opportunities[:5], 1):  # 只显示 top 5
-        print(f"#{i} [{opp.source.upper()}] 评分：{opp.score}/100")
+        print(f"#{i} [{opp.source.upper()}] {opp.decision_label()} | 信号：{_signal_strength_label(opp.display_score())}")
         print(f"   标题：{opp.title}")
         print(f"   链接：{opp.url}")
         print()

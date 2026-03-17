@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 
+import os
+import tempfile
 import unittest
+from unittest.mock import patch
 
 from main import (
     _build_phase2_assessment,
@@ -9,114 +12,14 @@ from main import (
     _sanitize_secret_text,
     _wedge_statement,
     rerank_for_solo,
+    save_phase1_report,
+    save_top10_report,
 )
 from models.opportunity import Opportunity
 
 
 class Phase2ScreeningTests(unittest.TestCase):
-    def test_red_ocean_project_management_is_dropped(self):
-        opp = Opportunity(
-            id="pm-1",
-            title="Planning - $10K MRR project management tool",
-            source="indiehackers",
-            url="https://example.com/planning",
-            score=78,
-            description="开发面向独立开发者和小团队的项目管理工具，解决任务跟踪、进度管理和团队协作痛点。",
-            summary="项目管理工具市场成熟，已有成功案例证明可行性。",
-            startup_cost="$1-5k",
-            time_to_revenue="30天",
-            revenue_model="订阅",
-            monthly_potential="$10-50k",
-            automation_rate="90%+",
-            customer_acquisition="SEO",
-            risks="市场竞争激烈，Linear、Jira、Notion 已经占据主战场，用户获取成本高。",
-            tags=["SaaS", "B2B", "项目管理", "自动化"],
-        )
-
-        assessment = _build_phase2_assessment(opp)
-
-        self.assertEqual(assessment.verdict, "drop")
-        self.assertLess(assessment.adjusted_score, 60)
-        self.assertIn("主战场", _filtered_reason(opp, assessment))
-
-    def test_narrow_direct_demand_case_can_still_be_kept(self):
-        opp = Opportunity(
-            id="ops-1",
-            title="Refund abuse audit for Shopify merchants",
-            source="reddit_r/shopify",
-            url="https://example.com/refunds",
-            score=90,
-            description="帮助 Shopify 商家每周识别退款滥用和高风险订单，目标用户为月销 5-50 万美元的 Shopify 商家运营负责人。",
-            summary="直接解决高频退款损失问题，适合先卖一项人工兜底的审计服务。",
-            startup_cost="$1-5k",
-            time_to_revenue="14天",
-            revenue_model="一次性",
-            monthly_potential="$10-50k",
-            automation_rate="90%+",
-            customer_acquisition="从 Shopify 退款求助帖、DTC 创始人社群和支付风控讨论串里外联首批 20 家商家",
-            risks="误报会影响商家信任，需要把交付边界收窄在审计建议而非自动封禁。",
-            action_plan="先做一版每周退款滥用审计报告，外联 20 家近期讨论退款问题的 Shopify 商家，收取首批试点审计费。",
-            tags=["SaaS", "B2B", "电商", "风控"],
-        )
-
-        assessment = _build_phase2_assessment(opp)
-
-        self.assertEqual(assessment.verdict, "keep")
-        self.assertGreaterEqual(assessment.adjusted_score, 83)
-
-    def test_generic_acquisition_and_mvp_template_do_not_pass_keep_bar(self):
-        opp = Opportunity(
-            id="ops-2",
-            title="Customer support copilot for SMB SaaS",
-            source="reddit_r/entrepreneur",
-            url="https://example.com/copilot",
-            score=88,
-            description="帮助小型 SaaS 团队更快处理客服工单，目标用户为 5-20 人 SaaS 团队创始人。",
-            summary="问题存在，但当前分发与首单动作还比较泛。",
-            startup_cost="$1-5k",
-            time_to_revenue="14天",
-            revenue_model="订阅",
-            monthly_potential="$10-50k",
-            automation_rate="90%+",
-            customer_acquisition="Cold outreach and partnerships",
-            risks="Zendesk 等客服平台可能补功能。",
-            action_plan="先做 MVP，根据反馈迭代。",
-            tags=["SaaS", "B2B", "客服", "AI"],
-        )
-
-        assessment = _build_phase2_assessment(opp)
-
-        self.assertNotEqual(assessment.verdict, "keep")
-        self.assertIn("首批用户来源", " ".join(assessment.keep_gaps))
-        self.assertIn("模板话", " ".join(assessment.keep_gaps))
-
-    def test_wedge_statement_is_specific_for_billing_analytics(self):
-        opp = Opportunity(
-            id="billing-1",
-            title="Baremetrics - $15K MRR from Stripe analytics",
-            source="indiehackers",
-            url="https://example.com/baremetrics",
-            score=82,
-            description="提供 Stripe 支付数据的深度分析和可视化服务，帮助 SaaS 企业理解收入趋势、客户行为和财务指标。目标用户为使用 Stripe 的 B2B 公司创始人和财务负责人。",
-            summary="Stripe 数据分析需求明确，但官方能力和同类产品竞争都很强。",
-            startup_cost="$1-5k",
-            time_to_revenue="30天",
-            revenue_model="订阅",
-            monthly_potential="$10-50k",
-            automation_rate="90%+",
-            customer_acquisition="SEO",
-            risks="Stripe 可能推出官方分析工具形成竞争，API 变更影响产品稳定性。",
-            tags=["SaaS", "B2B", "Stripe", "数据分析"],
-        )
-
-        assessment = _build_phase2_assessment(opp)
-        wedge = _wedge_statement(opp, assessment)
-
-        self.assertIn("Stripe", wedge)
-        self.assertIn("failed payment", wedge)
-        self.assertNotIn("围绕", wedge)
-
-    def test_rerank_and_bucket_are_verdict_first(self):
+    def _make_keep_watch_drop_triplet(self):
         keep = Opportunity(
             id="keep-1",
             title="Refund abuse audit for Shopify merchants",
@@ -171,7 +74,95 @@ class Phase2ScreeningTests(unittest.TestCase):
             action_plan="先做 MVP，根据反馈迭代。",
             tags=["SaaS", "B2B", "项目管理", "自动化"],
         )
+        return keep, watch, drop
 
+    def test_red_ocean_project_management_is_dropped(self):
+        _, _, drop = self._make_keep_watch_drop_triplet()
+        assessment = _build_phase2_assessment(drop)
+
+        self.assertEqual(assessment.verdict, "drop")
+        self.assertLess(assessment.adjusted_score, 60)
+        self.assertIn("主战场", _filtered_reason(drop, assessment))
+
+    def test_narrow_direct_demand_case_can_still_be_kept(self):
+        keep, _, _ = self._make_keep_watch_drop_triplet()
+        keep.action_plan = "先做一版每周退款滥用审计报告，外联 20 家近期讨论退款问题的 Shopify 商家，收取首批试点审计费。"
+
+        assessment = _build_phase2_assessment(keep)
+
+        self.assertEqual(assessment.verdict, "keep")
+        self.assertGreaterEqual(assessment.adjusted_score, 83)
+
+    def test_generic_acquisition_and_mvp_template_do_not_pass_keep_bar(self):
+        opp = Opportunity(
+            id="ops-2",
+            title="Customer support copilot for SMB SaaS",
+            source="reddit_r/entrepreneur",
+            url="https://example.com/copilot",
+            score=88,
+            description="帮助小型 SaaS 团队更快处理客服工单，目标用户为 5-20 人 SaaS 团队创始人。",
+            summary="问题存在，但当前分发与首单动作还比较泛。",
+            startup_cost="$1-5k",
+            time_to_revenue="14天",
+            revenue_model="订阅",
+            monthly_potential="$10-50k",
+            automation_rate="90%+",
+            customer_acquisition="Cold outreach and partnerships",
+            risks="Zendesk 等客服平台可能补功能。",
+            action_plan="先做 MVP，根据反馈迭代。",
+            tags=["SaaS", "B2B", "客服", "AI"],
+        )
+
+        assessment = _build_phase2_assessment(opp)
+
+        self.assertEqual(assessment.verdict, "drop")
+        self.assertIn("首批用户来源", " ".join(assessment.keep_gaps))
+        self.assertIn("模板话", " ".join(assessment.keep_gaps))
+        self.assertIn("首客名单和首单动作都还是模板话", " ".join(assessment.kill_reasons))
+
+    def test_wedge_statement_is_specific_for_billing_analytics(self):
+        opp = Opportunity(
+            id="billing-1",
+            title="Baremetrics - $15K MRR from Stripe analytics",
+            source="indiehackers",
+            url="https://example.com/baremetrics",
+            score=82,
+            description="提供 Stripe 支付数据的深度分析和可视化服务，帮助 SaaS 企业理解收入趋势、客户行为和财务指标。目标用户为使用 Stripe 的 B2B 公司创始人和财务负责人。",
+            summary="Stripe 数据分析需求明确，但官方能力和同类产品竞争都很强。",
+            startup_cost="$1-5k",
+            time_to_revenue="30天",
+            revenue_model="订阅",
+            monthly_potential="$10-50k",
+            automation_rate="90%+",
+            customer_acquisition="SEO",
+            risks="Stripe 可能推出官方分析工具形成竞争，API 变更影响产品稳定性。",
+            tags=["SaaS", "B2B", "Stripe", "数据分析"],
+        )
+
+        assessment = _build_phase2_assessment(opp)
+        wedge = _wedge_statement(opp, assessment)
+
+        self.assertIn("Stripe", wedge)
+        self.assertIn("failed payment", wedge)
+        self.assertNotIn("围绕", wedge)
+
+    def test_wedge_statement_prefers_extracted_refund_wedge_over_loose_profile_match(self):
+        keep, _, _ = self._make_keep_watch_drop_triplet()
+        keep.id = "refund-2"
+        keep.url = "https://example.com/refunds-2"
+        keep.summary = "先卖人工兜底的退款审计服务。"
+        keep.action_plan = "先做一版每周退款滥用审计报告，外联 20 家近期讨论退款问题的 Shopify 商家，收取首批试点审计费。"
+
+        assessment = _build_phase2_assessment(keep)
+        wedge = _wedge_statement(keep, assessment)
+
+        self.assertEqual(assessment.verdict, "keep")
+        self.assertIn("退款滥用审计报告", wedge)
+        self.assertIn("退款争议", wedge)
+        self.assertNotIn("Stripe", wedge)
+
+    def test_rerank_and_bucket_are_verdict_first(self):
+        keep, watch, drop = self._make_keep_watch_drop_triplet()
         opportunities = [drop, watch, keep]
         assessments = {opp.id: _build_phase2_assessment(opp) for opp in opportunities}
 
@@ -183,6 +174,32 @@ class Phase2ScreeningTests(unittest.TestCase):
         self.assertEqual(watchlist[0].id, "watch-1")
         self.assertEqual(dropped[0].id, "drop-1")
 
+    def test_weak_story_signal_defaults_to_drop_instead_of_watch(self):
+        opp = Opportunity(
+            id="weak-1",
+            title="AI founder newsletter from launch stories",
+            source="indiehackers",
+            url="https://example.com/newsletter",
+            score=92,
+            description="整理 AI founder launch story 与 best practice，做成 newsletter 和内容站。",
+            summary="成功案例很多，热度高。",
+            startup_cost="$1-5k",
+            time_to_revenue="30天",
+            revenue_model="订阅",
+            monthly_potential="$10-50k",
+            automation_rate="90%+",
+            customer_acquisition="SEO and social media",
+            risks="内容竞争激烈。",
+            action_plan="先做 MVP，根据反馈迭代。",
+            tags=["内容", "培训"],
+        )
+
+        assessment = _build_phase2_assessment(opp)
+
+        self.assertEqual(assessment.verdict, "drop")
+        self.assertLess(assessment.evidence_score, 4)
+        self.assertIn("案例热度", " ".join(assessment.kill_reasons))
+
     def test_feishu_error_sanitization_masks_secrets(self):
         raw = '{"app_id":"cli_secret","app_secret":"top_secret"} and top_secret'
         sanitized = _sanitize_secret_text(raw, ["cli_secret", "top_secret"])
@@ -190,6 +207,59 @@ class Phase2ScreeningTests(unittest.TestCase):
         self.assertNotIn("cli_secret", sanitized)
         self.assertNotIn("top_secret", sanitized)
         self.assertIn("***", sanitized)
+
+    def test_phase1_report_uses_decision_support_wording_without_numeric_scores(self):
+        keep, watch, drop = self._make_keep_watch_drop_triplet()
+        opportunities = [keep, watch, drop]
+        assessments = {opp.id: _build_phase2_assessment(opp) for opp in opportunities}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("main.DATA_DIR", tmpdir), patch("main._agent_reach_health_summary_lines", return_value=[]):
+                save_phase1_report(opportunities, assessments)
+
+            with open(os.path.join(tmpdir, "latest_phase1.md"), "r", encoding="utf-8") as f:
+                report = f.read()
+
+        self.assertIn("## Recommended Bet", report)
+        self.assertIn("## Keep Warm", report)
+        self.assertIn("## Pass For Now", report)
+        self.assertIn("- 机会信号:", report)
+        self.assertIn("- 证据摘要:", report)
+        self.assertNotIn("/100", report)
+        self.assertNotIn("筛选分", report)
+        self.assertNotIn("## Watchlist", report)
+        self.assertNotIn("## Not Worth Doing Now", report)
+
+    def test_top0_report_uses_no_bet_wording(self):
+        _, _, drop = self._make_keep_watch_drop_triplet()
+        assessments = {drop.id: _build_phase2_assessment(drop)}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("main.DATA_DIR", tmpdir), patch("main._agent_reach_health_summary_lines", return_value=[]):
+                save_phase1_report([drop], assessments, run_notes=["dedupe run"])
+
+            with open(os.path.join(tmpdir, "latest_phase1.md"), "r", encoding="utf-8") as f:
+                report = f.read()
+
+        self.assertIn("## No Bet Today", report)
+        self.assertNotIn("## Top0", report)
+        self.assertIn("今天没有出现值得 founder 立刻投入验证周期的切口。", report)
+
+    def test_top10_report_uses_signal_labels_instead_of_scores(self):
+        keep, _, _ = self._make_keep_watch_drop_triplet()
+        keep.phase2_adjusted_score = _build_phase2_assessment(keep).adjusted_score
+        keep.phase2_decision_label = "立即验证"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("main.DATA_DIR", tmpdir):
+                save_top10_report([keep])
+
+            with open(os.path.join(tmpdir, "latest_top10.md"), "r", encoding="utf-8") as f:
+                report = f.read()
+
+        self.assertIn("- 机会信号:", report)
+        self.assertIn("- 建议动作:", report)
+        self.assertNotIn("/100", report)
 
 
 if __name__ == "__main__":

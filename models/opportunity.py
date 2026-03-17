@@ -49,6 +49,14 @@ class Opportunity:
             return "C"
         return "D"
 
+    def signal_strength_label(self) -> str:
+        return {
+            "A": "高",
+            "B": "中高",
+            "C": "待验证",
+            "D": "弱",
+        }[self.grade_label()]
+
     def decision_label(self) -> str:
         custom = getattr(self, "phase2_decision_label", "")
         if custom:
@@ -112,7 +120,7 @@ class Opportunity:
         risk_logic = getattr(self, "phase2_not_crushed", self.risks or "待分析")
         
         return f"""
-{emoji} 【一人公司机会 #{self.id}】{self.decision_label()} | 等级 {self.grade_label()}
+{emoji} 【一人公司机会 #{self.id}】{self.decision_label()} | 机会信号 {self.signal_strength_label()}
 
 📌 切入 wedge：{wedge}
 🔗 来源：{self.source.upper()} | {self.url}
