@@ -1635,15 +1635,7 @@ async function insertUnderDocList(docToken, lineMarkdown) {
   const siblings = childrenRes.data?.items || [];
   const hIdx = siblings.findIndex(s => s.block_id === heading.block_id);
   if (hIdx < 0) throw new Error('未找到“文档列表”区块在父节点中的位置');
-  const hLevel = headingLevel(heading.block_type) || 99;
-  let insertIndex = siblings.length;
-  for (let i = hIdx + 1; i < siblings.length; i++) {
-    const lvl = headingLevel(siblings[i].block_type);
-    if (lvl !== null && lvl <= hLevel) {
-      insertIndex = i;
-      break;
-    }
-  }
+  const insertIndex = hIdx + 1;
   const { blocks: newBlocks, firstLevelBlockIds } = await convertMarkdown(lineMarkdown);
   const res = await client.docx.documentBlockDescendant.create({
     path: { document_id: docToken, block_id: parentId },
