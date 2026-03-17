@@ -6,6 +6,8 @@ from unittest.mock import Mock, patch
 import main
 from collectors.appstore_reviews import AppStoreReviewsCollector
 from collectors.github_issues import GitHubIssuesCollector
+from collectors.reddit_pain import RedditPainCollector
+from collectors.saas_reviews import SaaSReviewsCollector
 
 
 class _FakeResponse:
@@ -98,27 +100,27 @@ class NewSourceCollectorTests(unittest.TestCase):
         self.assertIn("example/repo", items[0]["title"])
         self.assertEqual(items[0]["score"], 6)
 
-    def test_collect_data_includes_new_sources_only_when_enabled(self):
-        with patch.object(main.HNCollector, "fetch", return_value=[]), patch.object(main.PHCollector, "fetch", return_value=[]), patch.object(
-            main.ChineseMediaCollector, "fetch", return_value=[]
-        ), patch.object(main.IndieHackersCollector, "fetch", return_value=[]), patch.object(
-            main.GitHubTrendingCollector, "fetch", return_value=[]
-        ), patch.object(main.RedditCollector, "fetch", return_value=[]), patch.object(
-            main.AppStoreReviewsCollector, "fetch", return_value=[{"id": "a1", "title": "app review", "source": "appstore_reviews", "url": "https://example.com"}]
-        ), patch.object(
-            main.GitHubIssuesCollector, "fetch", return_value=[{"id": "g1", "title": "issue pain", "source": "github_issues", "url": "https://example.com"}]
-        ):
+    def test_collect_data_includes_pain_sources_by_default(self):
+        with patch.object(main.HNCollector, "fetch", return_value=[]), \
+             patch.object(main.PHCollector, "fetch", return_value=[]), \
+             patch("main.ChineseMediaCollector.fetch", return_value=[]), \
+             patch("main.IndieHackersCollector.fetch", return_value=[]), \
+             patch("main.GitHubTrendingCollector.fetch", return_value=[]), \
+             patch("main.RedditCollector.fetch", return_value=[]), \
+             patch("main.RedditPainCollector.fetch", return_value=[]), \
+             patch("main.SaaSReviewsCollector.fetch", return_value=[]), \
+             patch.object(AppStoreReviewsCollector, "fetch", return_value=[
+                 {"id": "a1", "title": "app review", "source": "appstore_reviews", "url": "https://example.com"}
+             ]), \
+             patch.object(GitHubIssuesCollector, "fetch", return_value=[
+                 {"id": "g1", "title": "issue pain", "source": "github_issues", "url": "https://example.com"}
+             ]):
             items = main.collect_data(
-                hn_limit=0,
-                ph_limit=0,
-                media_hours=1,
-                indie_limit=0,
-                reddit_limit=0,
-                github_limit=0,
-                enable_app_store_reviews=True,
-                app_store_review_limit=2,
-                enable_github_pain_issues=True,
-                github_pain_limit=2,
+                hn_limit=0, ph_limit=0, media_hours=1, indie_limit=0,
+                reddit_limit=0, github_limit=0,
+                enable_app_store_reviews=True, app_store_review_limit=2,
+                enable_github_pain_issues=True, github_pain_limit=2,
+                reddit_pain_limit=0, enable_saas_reviews=False,
             )
 
         sources = {item["source"] for item in items}

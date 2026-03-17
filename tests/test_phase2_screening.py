@@ -5,17 +5,16 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from main import (
+from screening.phase2 import (
     _build_phase2_assessment,
     _bucket_phase2_candidates,
     _daily_rule_adjustment,
     _filtered_reason,
-    _sanitize_secret_text,
     _wedge_statement,
     rerank_for_solo,
-    save_phase1_report,
-    save_top10_report,
 )
+from integrations.feishu import _sanitize_secret_text
+from reports.daily_report import save_phase1_report, save_top10_report
 from models.opportunity import Opportunity
 
 
@@ -215,7 +214,7 @@ class Phase2ScreeningTests(unittest.TestCase):
         assessments = {opp.id: _build_phase2_assessment(opp) for opp in opportunities}
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch("main.DATA_DIR", tmpdir), patch("main._agent_reach_health_summary_lines", return_value=[]):
+            with patch("reports.daily_report.DATA_DIR", tmpdir), patch("reports.daily_report._agent_reach_health_summary_lines", return_value=[]):
                 save_phase1_report(opportunities, assessments)
 
             with open(os.path.join(tmpdir, "latest_phase1.md"), "r", encoding="utf-8") as f:
@@ -252,7 +251,7 @@ class Phase2ScreeningTests(unittest.TestCase):
         assessments = {drop.id: _build_phase2_assessment(drop)}
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch("main.DATA_DIR", tmpdir), patch("main._agent_reach_health_summary_lines", return_value=[]):
+            with patch("reports.daily_report.DATA_DIR", tmpdir), patch("reports.daily_report._agent_reach_health_summary_lines", return_value=[]):
                 save_phase1_report([drop], assessments, run_notes=["dedupe run"])
 
             with open(os.path.join(tmpdir, "latest_phase1.md"), "r", encoding="utf-8") as f:
@@ -273,7 +272,7 @@ class Phase2ScreeningTests(unittest.TestCase):
         keep.phase2_final_conclusion = "做 7 天 MVP 验证。先把退款滥用审计报告卖给近期正在处理退款争议的商家。"
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch("main.DATA_DIR", tmpdir):
+            with patch("reports.daily_report.DATA_DIR", tmpdir):
                 save_top10_report([keep])
 
             with open(os.path.join(tmpdir, "latest_top10.md"), "r", encoding="utf-8") as f:

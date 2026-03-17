@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-调研 Agent - 发现产品机会
+调研 Agent - 发现产品机会（一人公司视角）
 
 用法:
-    python3 main.py              # 手动运行
+    python3 main.py              # 正常运行
     python3 main.py --test       # 测试模式
     python3 main.py --debug      # 调试模式
+    python3 main.py --weekly-report  # 生成深筛周报
+    python3 main.py --feedback   # 录入历史机会反馈
 
 配置:
     复制 .env.example 为 .env 并填写 API Key
@@ -16,233 +18,133 @@ import sys
 import json
 import asyncio
 import argparse
+import hashlib
+import re
 from collections import defaultdict
-from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
-import hashlib
-import subprocess
-import tempfile
-import re
-import shutil
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
-# 添加项目路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from mvp_generator import MVPGenerator
-from config import DEBUG, DATA_DIR, LOG_DIR, BAILIAN_API_KEY, FEISHU_APP_ID, FEISHU_APP_SECRET, FEISHU_USER_ID, FEISHU_INDEX_DOC_TOKEN, FEISHU_DOC_SYNC_ENABLED, validate_config, GITHUB_TOKEN, GITHUB_REPO
+from config import DEBUG, DATA_DIR, LOG_DIR, BAILIAN_API_KEY, validate_config
 from enrichers import WebEnricher
 from collectors import (
-    AgentReachBridge,
-    AppStoreReviewsCollector,
-    ChineseMediaCollector,
-    GitHubIssuesCollector,
-    GitHubTrendingCollector,
-    HNCollector,
-    PHCollector,
-    RedditPainCollector,
-    SaaSReviewsCollector,
+    AgentReachBridge, AppStoreReviewsCollector, ChineseMediaCollector,
+    GitHubIssuesCollector, GitHubTrendingCollector, HNCollector, PHCollector,
+    RedditPainCollector, SaaSReviewsCollector,
 )
 from collectors.indiehackers import IndieHackersCollector
 from collectors.reddit import RedditCollector
 from analyzers import BailianAnalyzer
 from models import Opportunity
 
-PHASE1_KEEP_MIN_SCORE = 75
-PHASE1_FILTER_LIMIT = 5
-PHASE2_WATCH_LIMIT = 3
-PHASE2_KEEP_MIN_SCORE = 83
-PHASE2_WATCH_MIN_SCORE = 72
-FINAL_ACTION_LANDING_PAGE = '做 landing page 验证'
-FINAL_ACTION_7DAY_MVP = '做 7 天 MVP 验证'
-FINAL_ACTION_DROP = '丢弃'
-
-SOURCE_QUALITY: Dict[str, str] = {
-    'appstore_reviews': 'pain',
-    'github_issues': 'pain',
-    'reddit_pain': 'pain',
-    'saas_reviews': 'pain',
-    'reddit': 'discussion',
-    'reddit_r/saas': 'discussion',
-    'reddit_r/entrepreneur': 'discussion',
-    'github': 'discussion',
-    'github_trending': 'discussion',
-    'x': 'discussion',
-    'hn': 'hype',
-    'ph': 'hype',
-    'indiehackers': 'story',
-    '36kr': 'news',
-    'huxiu': 'news',
-    'tiehan': 'news',
-}
-
-SOURCE_QUALITY_SCORE: Dict[str, int] = {
-    'pain': 5,
-    'discussion': 2,
-    'hype': -3,
-    'story': -5,
-    'news': -4,
-}
+from screening.constants import SOURCE_QUALITY, SOURCE_QUALITY_SCORE
+from screening.phase2 import (
+    _build_phase2_assessment, _annotate_phase2_assessments,
+    _bucket_phase2_candidates, rerank_for_solo,
+    _cross_source_correlation, _apply_feedback_boosts,
+    _daily_rule_adjustment, _decision_label, _signal_strength_label,
+    _filtered_reason, _load_feedback, _save_feedback,
+    _normalize_title,
+)
+from reports import save_phase1_report, save_top10_report, print_phase1_results, print_results
+from reports.weekly_report import save_weekly_report, _fingerprint_opportunity, _restore_opportunity_from_dict
+from integrations import sync_report_to_feishu, send_to_feishu
+from integrations.github_issues import create_github_issues
+from mvp_generator import MVPGenerator
 
 
-@dataclass
-class ScreeningAssessment:
-    raw_score: int
-    adjusted_score: int
-    verdict: str
-    evidence_score: int
-    strengths: List[str] = field(default_factory=list)
-    keep_gaps: List[str] = field(default_factory=list)
-    kill_reasons: List[str] = field(default_factory=list)
-    crowded_hits: List[str] = field(default_factory=list)
-    frontline_hits: List[str] = field(default_factory=list)
-    heavy_delivery_hits: List[str] = field(default_factory=list)
-    platform_dependency_hits: List[str] = field(default_factory=list)
-    category_label: str = ""
-    avoid_label: str = ""
-    target_user: str = ""
-    trigger_event: str = ""
-    deliverable: str = ""
-    first_users_hint: str = ""
-
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 
 def setup_logging():
-    """设置日志"""
     import logging as loglib
-    
     log_file = os.path.join(LOG_DIR, f"research_{datetime.now().strftime('%Y%m%d')}.log")
-    
-    # 简单的日志配置
     loglib.basicConfig(
         level=loglib.DEBUG if DEBUG else loglib.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            loglib.FileHandler(log_file),
-            loglib.StreamHandler()
-        ]
+        handlers=[loglib.FileHandler(log_file), loglib.StreamHandler()],
     )
     return loglib.getLogger(__name__)
 
 
-def collect_data(hn_limit: int = 10, ph_limit: int = 5, media_hours: int = 48,
-                 indie_limit: int = 15, reddit_limit: int = 10, github_limit: int = 10,
-                 enable_agent_reach: bool = False, ar_limit: int = 10,
-                 enable_app_store_reviews: bool = True, app_store_review_limit: int = 15,
-                 enable_github_pain_issues: bool = True, github_pain_limit: int = 15,
-                 reddit_pain_limit: int = 15,
-                 enable_saas_reviews: bool = True, saas_review_limit: int = 12) -> List[dict]:
-    """收集数据"""
+# ---------------------------------------------------------------------------
+# Data collection
+# ---------------------------------------------------------------------------
+
+def collect_data(
+    hn_limit=10, ph_limit=5, media_hours=48,
+    indie_limit=15, reddit_limit=10, github_limit=10,
+    enable_agent_reach=False, ar_limit=10,
+    enable_app_store_reviews=True, app_store_review_limit=15,
+    enable_github_pain_issues=True, github_pain_limit=15,
+    reddit_pain_limit=15,
+    enable_saas_reviews=True, saas_review_limit=12,
+) -> List[dict]:
+    """收集数据 -- 按信号质量分组采集"""
     import logging
     logger = logging.getLogger(__name__)
-    
     items = []
-    
-    # --- Pain-point sources (highest signal quality) ---
 
+    # --- Pain-point sources (highest signal quality) ---
     if enable_app_store_reviews:
         logger.info(f"Fetching App Store reviews (limit={app_store_review_limit})...")
-        app_store_collector = AppStoreReviewsCollector()
-        app_store_items = app_store_collector.fetch(limit=app_store_review_limit)
-        logger.info(f"Got {len(app_store_items)} App Store review items")
-        items.extend(app_store_items)
+        items.extend(AppStoreReviewsCollector().fetch(limit=app_store_review_limit))
 
     if enable_github_pain_issues:
         logger.info(f"Fetching GitHub issue pains (limit={github_pain_limit})...")
-        github_issue_collector = GitHubIssuesCollector()
-        github_issue_items = github_issue_collector.fetch(limit=github_pain_limit)
-        logger.info(f"Got {len(github_issue_items)} GitHub issue pain items")
-        items.extend(github_issue_items)
+        items.extend(GitHubIssuesCollector().fetch(limit=github_pain_limit))
 
     logger.info(f"Fetching Reddit pain signals (limit={reddit_pain_limit})...")
-    reddit_pain_collector = RedditPainCollector()
-    reddit_pain_items = reddit_pain_collector.fetch(limit=reddit_pain_limit)
-    logger.info(f"Got {len(reddit_pain_items)} Reddit pain items")
-    items.extend(reddit_pain_items)
+    items.extend(RedditPainCollector().fetch(limit=reddit_pain_limit))
 
     if enable_saas_reviews:
         logger.info(f"Fetching SaaS review complaints (limit={saas_review_limit})...")
-        saas_collector = SaaSReviewsCollector()
-        saas_items = saas_collector.fetch(limit=saas_review_limit)
-        logger.info(f"Got {len(saas_items)} SaaS review items")
-        items.extend(saas_items)
+        items.extend(SaaSReviewsCollector().fetch(limit=saas_review_limit))
 
     # --- Discussion sources ---
-
-    # GitHub Trending
     logger.info(f"Fetching GitHub Trending (limit={github_limit})...")
-    gh_collector = GitHubTrendingCollector()
-    gh_items = gh_collector.fetch(limit=github_limit)
-    logger.info(f"Got {len(gh_items)} GitHub Trending items")
-    items.extend(gh_items)
+    items.extend(GitHubTrendingCollector().fetch(limit=github_limit))
 
-    # fallback legacy Reddit collector (kept for compatibility)
     if not enable_agent_reach:
         logger.info(f"Fetching Reddit (limit={reddit_limit})...")
-        reddit_collector = RedditCollector()
-        reddit_items = reddit_collector.fetch(limit=reddit_limit)
-        logger.info(f"Got {len(reddit_items)} Reddit items")
-        items.extend(reddit_items)
+        items.extend(RedditCollector().fetch(limit=reddit_limit))
 
     # --- Hype / news sources ---
-
-    # Hacker News
     logger.info(f"Fetching HN (limit={hn_limit})...")
-    hn_items = HNCollector.fetch(limit=hn_limit)
-    logger.info(f"Got {len(hn_items)} HN items")
-    items.extend(hn_items)
-    
-    # Product Hunt
-    logger.info(f"Fetching PH (limit={ph_limit})...")
-    ph_items = PHCollector.fetch(limit=ph_limit)
-    logger.info(f"Got {len(ph_items)} PH items")
-    items.extend(ph_items)
-    
-    # Chinese Media (36Kr, Huxiu, etc.)
-    logger.info(f"Fetching Chinese Media (hours={media_hours})...")
-    media_items = ChineseMediaCollector.fetch(hours=media_hours, limit=20)
-    logger.info(f"Got {len(media_items)} Chinese media items")
-    items.extend(media_items)
-    
-    # IndieHackers (solo founder stories)
-    logger.info(f"Fetching IndieHackers (limit={indie_limit})...")
-    ih_collector = IndieHackersCollector()
-    ih_items = ih_collector.fetch(limit=indie_limit)
-    logger.info(f"Got {len(ih_items)} IndieHackers items")
-    items.extend(ih_items)
+    items.extend(HNCollector.fetch(limit=hn_limit))
 
-    # Agent Reach bridge (P1: X / YouTube / Reddit)
+    logger.info(f"Fetching PH (limit={ph_limit})...")
+    items.extend(PHCollector.fetch(limit=ph_limit))
+
+    logger.info(f"Fetching Chinese Media (hours={media_hours})...")
+    items.extend(ChineseMediaCollector.fetch(hours=media_hours, limit=20))
+
+    logger.info(f"Fetching IndieHackers (limit={indie_limit})...")
+    items.extend(IndieHackersCollector().fetch(limit=indie_limit))
+
+    # --- Agent Reach bridge ---
     if enable_agent_reach:
         logger.info(f"Fetching Agent Reach sources (limit={ar_limit})...")
         ar = AgentReachBridge(DATA_DIR)
         health = ar.check_health()
+        for platform, fetcher in [('x', ar.fetch_x), ('youtube', ar.fetch_youtube), ('reddit', ar.fetch_reddit)]:
+            if health.get(platform):
+                items.extend(fetcher(limit=ar_limit))
+            else:
+                logger.info(f"Skip Agent Reach {platform} (unhealthy)")
 
-        if health.get("x"):
-            x_items = ar.fetch_x(limit=ar_limit)
-            logger.info(f"Got {len(x_items)} Agent Reach X items")
-            items.extend(x_items)
-        else:
-            logger.info("Skip Agent Reach X (unhealthy)")
-
-        if health.get("youtube"):
-            y_items = ar.fetch_youtube(limit=ar_limit)
-            logger.info(f"Got {len(y_items)} Agent Reach YouTube items")
-            items.extend(y_items)
-        else:
-            logger.info("Skip Agent Reach YouTube (unhealthy)")
-
-        if health.get("reddit"):
-            r_items = ar.fetch_reddit(limit=ar_limit)
-            logger.info(f"Got {len(r_items)} Agent Reach Reddit items")
-            items.extend(r_items)
-        else:
-            logger.info("Skip Agent Reach Reddit (unhealthy)")
-
+    logger.info(f"Collected {len(items)} total items")
     return items
 
 
+# ---------------------------------------------------------------------------
+# Analysis (with enrichment)
+# ---------------------------------------------------------------------------
+
 def analyze_items(items: List[dict], min_score: int = 60) -> List[Opportunity]:
-    """分析项目"""
     return asyncio.run(analyze_items_async(items, min_score=min_score))
 
 
@@ -270,14 +172,11 @@ async def analyze_items_async(items: List[dict], min_score: int = 60) -> List[Op
 
     analyzer = BailianAnalyzer()
     logger.info(f"Analyzing {len(items)} items (min_score={min_score})...")
-    opportunities = await analyzer.batch_analyze_async(
-        items, min_score=min_score, enrichment_map=enrichment_map,
-    )
+    opportunities = await analyzer.batch_analyze_async(items, min_score=min_score, enrichment_map=enrichment_map)
 
     for opp in opportunities:
-        item_id = str(opp.id)
-        if item_id in enrichment_map:
-            enrichment = enrichment_map[item_id]
+        enrichment = enrichment_map.get(str(opp.id))
+        if enrichment:
             opp.enrichment_evidence_score = enrichment.evidence_score
             opp.enrichment_competitor_count = enrichment.competitor_count
             opp.enrichment_pain_post_count = enrichment.pain_post_count
@@ -287,10 +186,11 @@ async def analyze_items_async(items: List[dict], min_score: int = 60) -> List[Op
     return opportunities
 
 
+# ---------------------------------------------------------------------------
+# Deduplication
+# ---------------------------------------------------------------------------
 
-
-def _normalize_title(title: str) -> str:
-    import re
+def _normalize_title_local(title: str) -> str:
     t = (title or '').lower()
     t = re.sub(r'https?://\S+', '', t)
     t = re.sub(r'[^\w\s\u4e00-\u9fff]', ' ', t)
@@ -298,10 +198,7 @@ def _normalize_title(title: str) -> str:
     return t
 
 
-
-
 def _normalize_url(url: str) -> str:
-    """URL 规范化：去掉常见追踪参数，统一域名/路径格式"""
     if not url:
         return ''
     try:
@@ -311,52 +208,38 @@ def _normalize_url(url: str) -> str:
         if netloc.startswith('www.'):
             netloc = netloc[4:]
         path = (u.path or '/').rstrip('/') or '/'
-
-        blocked_prefix = ('utm_', 'spm', 'from', 'source', 'ref', 'ref_src', 'fbclid', 'gclid', 'igshid', 'mkt_')
-        clean_q = []
-        for k, v in parse_qsl(u.query, keep_blank_values=False):
-            lk = k.lower()
-            if lk.startswith(blocked_prefix):
-                continue
-            clean_q.append((k, v))
+        blocked = ('utm_', 'spm', 'from', 'source', 'ref', 'ref_src', 'fbclid', 'gclid', 'igshid', 'mkt_')
+        clean_q = [(k, v) for k, v in parse_qsl(u.query, keep_blank_values=False) if not k.lower().startswith(blocked)]
         clean_q.sort(key=lambda kv: kv[0])
-        query = urlencode(clean_q, doseq=True)
-
-        return urlunparse((scheme, netloc, path, '', query, ''))
+        return urlunparse((scheme, netloc, path, '', urlencode(clean_q, doseq=True), ''))
     except Exception:
         return (url or '').strip()
 
 
-def _fingerprint_opportunity(opp: Opportunity) -> str:
-    title_norm = _normalize_title(opp.title)
+def _fingerprint_opp(opp: Opportunity) -> str:
+    title_norm = _normalize_title_local(opp.title)
     canonical_url = _normalize_url(opp.url or opp.source_url or '')
     domain = ''
     try:
         domain = urlparse(canonical_url).netloc.lower()
     except Exception:
-        domain = ''
-    raw = f"{title_norm[:160]}|{domain}|{canonical_url}"
-    return hashlib.sha1(raw.encode('utf-8')).hexdigest()
+        pass
+    return hashlib.sha1(f"{title_norm[:160]}|{domain}|{canonical_url}".encode('utf-8')).hexdigest()
 
 
 def _load_seen_fingerprints(days: int = 14):
     seen_file = os.path.join(DATA_DIR, 'seen_fingerprints.json')
-    now = datetime.now()
-    cutoff = now - timedelta(days=days)
+    cutoff = datetime.now() - timedelta(days=days)
     data = {'items': []}
-
     if os.path.exists(seen_file):
         try:
             with open(seen_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
         except Exception:
             data = {'items': []}
-
-    kept = []
-    seen_map = {}
+    kept, seen_map = [], {}
     for it in data.get('items', []):
-        ts = it.get('seen_at', '')
-        fp = it.get('fp', '')
+        ts, fp = it.get('seen_at', ''), it.get('fp', '')
         try:
             dt = datetime.fromisoformat(ts)
         except Exception:
@@ -364,37 +247,31 @@ def _load_seen_fingerprints(days: int = 14):
         if dt >= cutoff and fp:
             kept.append({'fp': fp, 'seen_at': ts})
             seen_map[fp] = dt
-
     return seen_file, kept, seen_map
 
 
 def deduplicate_across_days(opportunities: List[Opportunity], days: int = 14) -> List[Opportunity]:
-    """跨天去重：命中最近 N 天已见指纹则过滤"""
     seen_file, kept_items, seen_map = _load_seen_fingerprints(days=days)
-
     fresh = []
     for opp in opportunities:
-        fp = _fingerprint_opportunity(opp)
+        fp = _fingerprint_opp(opp)
         if fp in seen_map:
             continue
         fresh.append(opp)
         kept_items.append({'fp': fp, 'seen_at': datetime.now().isoformat()})
         seen_map[fp] = datetime.now()
-
     try:
         with open(seen_file, 'w', encoding='utf-8') as f:
             json.dump({'items': kept_items[-5000:]}, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f'Warning: failed to save seen_fingerprints: {e}')
-
     return fresh
 
 
 def deduplicate_opportunities(opportunities: List[Opportunity]) -> List[Opportunity]:
-    """按标题归一化去重：同类机会保留分数最高项"""
     best = {}
     for opp in opportunities:
-        key = _normalize_title(opp.title)[:120]
+        key = _normalize_title_local(opp.title)[:120]
         if not key:
             continue
         old = best.get(key)
@@ -403,2029 +280,38 @@ def deduplicate_opportunities(opportunities: List[Opportunity]) -> List[Opportun
     return list(best.values())
 
 
-def _cross_source_correlation(opportunities: List[Opportunity]) -> None:
-    """Find pain themes appearing across multiple independent source types and boost them.
-
-    Mutates opportunities in-place by setting opp.cross_source_boost.
-    """
-    theme_buckets: Dict[str, Dict[str, Any]] = {}
-
-    for opp in opportunities:
-        tags = [t.lower() for t in (opp.tags or [])]
-        title_words = set(_normalize_title(opp.title).split())
-        theme_keys = set(tags) | {w for w in title_words if len(w) > 3}
-
-        source_type = SOURCE_QUALITY.get((opp.source or '').lower(), 'hype')
-        for key in theme_keys:
-            if not key or len(key) < 3:
-                continue
-            bucket = theme_buckets.setdefault(key, {
-                'source_types': set(),
-                'opp_ids': [],
-            })
-            bucket['source_types'].add(source_type)
-            bucket['opp_ids'].append(opp.id)
-
-    opp_boosts: Dict[str, int] = defaultdict(int)
-    for key, bucket in theme_buckets.items():
-        unique_types = len(bucket['source_types'])
-        if unique_types >= 3:
-            boost = 8
-        elif unique_types >= 2:
-            boost = 5
-        else:
-            continue
-        for opp_id in bucket['opp_ids']:
-            opp_boosts[opp_id] = max(opp_boosts[opp_id], boost)
-
-    for opp in opportunities:
-        boost = opp_boosts.get(opp.id, 0)
-        opp.cross_source_boost = boost
-
-
-def rerank_for_solo(opportunities: List[Opportunity], assessments: Optional[dict] = None) -> List[Opportunity]:
-    """Phase 2 重排：先看 verdict，再看证据强度和筛选分。"""
-    assessments = assessments or {opp.id: _build_phase2_assessment(opp) for opp in opportunities}
-    verdict_order = {'keep': 0, 'watch': 1, 'drop': 2}
-
-    def sort_key(opp: Opportunity):
-        assessment = assessments.get(opp.id) or _build_phase2_assessment(opp)
-        return (
-            verdict_order.get(assessment.verdict, 3),
-            -assessment.evidence_score,
-            -assessment.adjusted_score,
-            -assessment.raw_score,
-        )
-
-    return sorted(opportunities, key=sort_key)
-
-
-def _clean_text(text: str) -> str:
-    return re.sub(r'\s+', ' ', (text or '').strip())
-
-
-def _truncate(text: str, limit: int = 160) -> str:
-    text = _clean_text(text)
-    if len(text) <= limit:
-        return text
-    return text[:limit - 1].rstrip() + '…'
-
-
-PHASE2_CATEGORY_PROFILES = [
-    {
-        'name': 'billing_analytics',
-        'terms': ['stripe', 'billing', 'mrr', 'churn', 'failed payment', 'subscription analytics', '支付', '订阅分析', '营收分析'],
-        'category_label': '支付/订阅分析',
-        'avoid_label': '完整的 Stripe 分析仪表盘',
-        'default_target': '使用 Stripe 的 20-200 人 SaaS 团队创始人或营收负责人',
-        'trigger': '每周复盘 MRR、流失和失败扣款时',
-        'deliverable': '一份可直接执行的 failed payment 与流失诊断报告',
-        'first_users_hint': '去 Indie Hackers、Stripe 开发者社区和讨论 churn / failed payment 的 SaaS 创始人帖子里定向约 20 人',
-        'crowded': True,
-    },
-    {
-        'name': 'project_management',
-        'terms': ['project management', 'task management', 'kanban', 'roadmap', 'sprint', '项目管理', '任务管理', '协作工具'],
-        'category_label': '项目管理',
-        'avoid_label': '一个新的项目管理工具',
-        'default_target': '2-10 人远程产品团队的创始人或项目负责人',
-        'trigger': '周会前或 sprint 切换时',
-        'deliverable': '一份自动清理过期任务并标出 blocker 的周会摘要',
-        'first_users_hint': '去 Indie Hackers、Linear/Jira/Notion 模板帖和远程团队社群里约首批 20 个团队负责人',
-        'crowded': True,
-    },
-    {
-        'name': 'ai_coding',
-        'terms': ['code generation', 'coding assistant', 'ai coding', 'developer tool', '开发工具', '代码生成', 'claude code', 'copilot', 'agent computer'],
-        'category_label': 'AI 开发工具',
-        'avoid_label': '一个通用 AI 编程助手',
-        'default_target': '维护单一代码栈的 3-20 人开发团队负责人',
-        'trigger': '需要新建模块、补测试或做迁移时',
-        'deliverable': '一个针对单一框架的脚手架、测试补全或迁移包',
-        'first_users_hint': '去 GitHub issues/discussions、Claude Code/Copilot 讨论区和开发者社群里找首批 20 个团队',
-        'crowded': True,
-    },
-    {
-        'name': 'transcription',
-        'terms': ['speech to text', 'voice', 'dictation', 'transcription', '语音', '转文字', '语音输入', '语音识别'],
-        'category_label': '语音转写',
-        'avoid_label': '一个通用语音输入工具',
-        'default_target': '每天要开会、访谈或写长文的 Mac 知识工作者',
-        'trigger': '会议、访谈或边走边记刚结束时',
-        'deliverable': '一份结构化纪要、待办列表和可直接发送的草稿',
-        'first_users_hint': '去写作者社区、播客/访谈从业者群和高频会议团队里约首批 20 个重度用户',
-        'crowded': True,
-    },
-    {
-        'name': 'focus_audio',
-        'terms': ['white noise', 'focus app', 'meditation', '白噪音', '专注', 'focus', '音频'],
-        'category_label': '专注/白噪音',
-        'avoid_label': '一个白噪音或专注应用',
-        'default_target': '需要长时间深度工作的远程知识工作者',
-        'trigger': '准备进入 60-90 分钟深度工作前',
-        'deliverable': '一套带番茄钟和专注复盘的深度工作 session',
-        'first_users_hint': '去深度工作、ADHD、远程办公社区里找愿意做 7 天专注实验的首批用户',
-        'crowded': True,
-    },
-    {
-        'name': 'content_training',
-        'terms': ['how i', 'best practice', 'playbook', 'training', 'course', '教程', '培训', '内容'],
-        'category_label': '内容/培训',
-        'avoid_label': '一个泛 AI 编程内容站或培训课',
-        'default_target': '想把 AI 编程流程标准化的 3-20 人工程团队负责人',
-        'trigger': '团队开始要求统一 prompt、review checklist 和交付规范时',
-        'deliverable': '一份基于真实代码库的 AI 编程 playbook 与评审清单',
-        'first_users_hint': '去 HN 评论区、工程管理社群和已有 AI 编程实践分享帖下定向约访 20 个团队负责人',
-        'crowded': False,
-    },
-]
-
-PHASE2_BIG_PLAYER_TERMS = {
-    'apple': 'Apple',
-    'ios': 'Apple',
-    'macos': 'Apple',
-    'google': 'Google',
-    'microsoft': 'Microsoft',
-    'openai': 'OpenAI',
-    'anthropic': 'Anthropic',
-    'claude': 'Claude',
-    'github copilot': 'GitHub Copilot',
-    'copilot': 'GitHub Copilot',
-    'notion': 'Notion',
-    'linear': 'Linear',
-    'jira': 'Jira',
-    'slack': 'Slack',
-    'figma': 'Figma',
-    'stripe': 'Stripe',
-    'deepgram': 'Deepgram',
-}
-
-PHASE2_HEAVY_DELIVERY_TERMS = [
-    'implementation service', 'consulting service', 'custom implementation', 'system integration',
-    'enterprise onboarding', 'deployment service', 'marketplace', 'two-sided', 'hardware', 'logistics',
-    '代运营', '咨询服务', '定制开发', '实施服务', '系统集成', '私有化部署', '硬件', '供应链', '双边市场'
-]
-PHASE2_GENERIC_ACQUISITION_TERMS = ['seo', 'product hunt', 'social media', '社交媒体', '付费广告', '广告', '联盟', 'app store', 'aso']
-PHASE2_SPECIFIC_ACQUISITION_TERMS = ['评论区', '帖子', '私信', '外联', '邮件', '名单', '社群', 'issue', 'discussion', 'subreddit', 'slack', 'discord', '论坛', '微信群', '评论者', '创始人', '群', '用户访谈']
-PHASE2_VAGUE_ACQUISITION_TERMS = ['cold outreach', 'outbound', 'linkedin', '朋友圈', '转介绍', 'partnership', 'bd', '销售', '社群运营', '社区运营', 'founder network']
-PHASE2_SIGNAL_WEAK_TERMS = ['融资', 'funding', 'launch', 'show hn', 'how i', 'essay', 'story', '案例', '教程', 'newsletter']
-PHASE2_PLATFORM_DEPENDENCY_TERMS = ['api变更', 'api 变更', '官方', '自带', '依赖单一', '单一平台', 'policy', 'policies', '平台策略']
-PHASE2_GENERIC_PLAN_TERMS = ['先做mvp', '先做 MVP', '根据反馈迭代', '再迭代', '验证需求', '上线看看', '先上线', 'build mvp', 'iterate', 'launch on product hunt']
-PHASE2_CONCRETE_PLAN_TERMS = ['试点', '审计', '脚本', '人工', '报价', '收取', '收费', '外联', '迁移', '报告', '清单', '访谈', '名单', 'pilot', 'audit', 'migration', 'report']
-PHASE2_CONCRETE_DELIVERABLE_TERMS = ['审计', '报告', '清单', '脚本', '迁移', 'migration', 'report', 'audit', 'playbook', '摘要', '诊断', '回复建议', 'review', 'checklist', '试点', 'pilot']
-PHASE2_GENERIC_WEDGE_TERMS = ['tool', 'tools', 'platform', 'assistant', 'copilot', 'workspace', 'system', '产品', '工具', '平台', '系统', '应用']
-PHASE2_TRIGGER_HINTS = [
-    (('refund', '退款', 'chargeback', '高风险订单'), '出现退款争议、退款滥用或高风险订单时'),
-    (('failed payment', '支付失败', '扣款失败'), 'failed payment 开始堆积时'),
-    (('churn', '流失'), '流失率抬头时'),
-    (('support', '客服', 'ticket', '工单'), '工单积压或回复超时时'),
-    (('migration', '迁移'), '准备做迁移或切换栈时'),
-    (('playbook', '评审清单', '代码库'), '团队准备把 AI 编程流程落进真实代码库时'),
-]
-PHASE2_DELIVERABLE_HINTS = [
-    (('refund', '退款', 'chargeback'), '一份退款滥用审计报告'),
-    (('failed payment', '支付失败', '扣款失败'), '一份 failed payment 与流失诊断报告'),
-    (('support', '客服', 'ticket', '工单'), '一份工单分流与回复建议清单'),
-    (('migration', '迁移'), '一个单一框架迁移包'),
-    (('playbook', '评审清单', '代码库'), '一份基于真实代码库的 AI 编程评审清单与 playbook'),
-]
-
-
-def _score_grade(score: int) -> str:
-    if score >= 86:
-        return 'A'
-    if score >= 78:
-        return 'B'
-    if score >= 68:
-        return 'C'
-    return 'D'
-
-
-def _signal_strength_label(score: int) -> str:
-    mapping = {
-        'A': '高',
-        'B': '中高',
-        'C': '待验证',
-        'D': '弱',
-    }
-    return mapping[_score_grade(score)]
-
-
-def _decision_label(score: int, verdict: Optional[str] = None) -> str:
-    if verdict == 'keep':
-        return FINAL_ACTION_7DAY_MVP
-    if verdict == 'watch':
-        return FINAL_ACTION_LANDING_PAGE
-    if verdict == 'drop':
-        return FINAL_ACTION_DROP
-    grade = _score_grade(score)
-    mapping = {
-        'A': FINAL_ACTION_7DAY_MVP,
-        'B': FINAL_ACTION_LANDING_PAGE,
-        'C': FINAL_ACTION_LANDING_PAGE,
-        'D': FINAL_ACTION_DROP,
-    }
-    return mapping[grade]
-
-
-def _is_fast_payback_window(text: str) -> bool:
-    normalized = _clean_text(text).lower()
-    if not normalized:
-        return False
-    return any(token in normalized for token in ['7天', '14天', '两周', '2周', 'two week', '<7', '7 days', '14 days'])
-
-
-def _is_medium_payback_window(text: str) -> bool:
-    normalized = _clean_text(text).lower()
-    if not normalized:
-        return False
-    return any(token in normalized for token in ['30天', '30 天', '30 days', '30days', '一个月'])
-
-
-def _combined_signal_text(opp: Opportunity) -> tuple[str, str]:
-    raw = ' '.join([
-        opp.title or '',
-        opp.summary or '',
-        opp.description or '',
-        opp.risks or '',
-        ' '.join(opp.tags or []),
-        opp.customer_acquisition or '',
-        opp.solo_feasibility or '',
-        opp.action_plan or '',
-    ]).strip()
-    return raw, raw.lower()
-
-
-def _match_terms(text: str, phrases: List[str]) -> List[str]:
-    hits = []
-    for phrase in phrases:
-        if phrase and phrase in text:
-            hits.append(phrase)
-    return hits
-
-
-def _normalize_term(term: str) -> str:
-    return term.replace('_', ' ').replace('/', ' / ').strip()
-
-
-def _pick_phase2_profile(text_lower: str) -> Optional[dict]:
-    best = None
-    best_score = 0
-    for profile in PHASE2_CATEGORY_PROFILES:
-        score = sum(1 for term in profile['terms'] if term in text_lower)
-        if score > best_score:
-            best = profile
-            best_score = score
-    return best if best_score >= 2 else None
-
-
-def _extract_specific_phrase(text: str, patterns: List[str], limit: int = 72) -> str:
-    haystack = _clean_text(text)
-    if not haystack:
-        return ''
-    for pattern in patterns:
-        match = re.search(pattern, haystack, re.IGNORECASE)
-        if not match:
-            continue
-        candidate = _clean_text(match.group(1))
-        candidate = re.sub(r'^(?:一版|一个|一份|一次|每周一次的|每周|一周内交付的|只交付|只卖|针对|面向)\s*', '', candidate, flags=re.IGNORECASE)
-        candidate = re.sub(r'^[的\s]+', '', candidate)
-        candidate = re.sub(r'[，。；,:：]+$', '', candidate)
-        candidate = _truncate(candidate, limit=limit)
-        if candidate:
-            return candidate
-    return ''
-
-
-def _looks_specific_deliverable(text: str) -> bool:
-    normalized = _clean_text(text).lower()
-    if not normalized:
-        return False
-    if any(term in normalized for term in PHASE2_GENERIC_WEDGE_TERMS):
-        return False
-    return any(term in normalized for term in PHASE2_CONCRETE_DELIVERABLE_TERMS)
-
-
-def _extract_trigger_candidate(opp: Opportunity) -> str:
-    _, text_lower = _combined_signal_text(opp)
-    for keywords, trigger in PHASE2_TRIGGER_HINTS:
-        if any(keyword in text_lower for keyword in keywords):
-            return trigger
-    return ''
-
-
-def _extract_deliverable_candidate(opp: Opportunity) -> str:
-    haystacks = [
-        opp.action_plan or '',
-        opp.description or '',
-        opp.summary or '',
-    ]
-    patterns = [
-        r'(?:先卖|先做|先交付|先提供|交付|提供|输出)(?:一版|一个|一份|一次|每周一次的|每周|一周内交付的|只交付|只卖)?([^，。；\n]{6,80})',
-        r'(?:卖|收取)[^，。；\n]{0,16}(?:的)?([^，。；\n]{6,80}(?:报告|审计|清单|脚本|迁移包|playbook|pilot|试点|诊断|摘要|方案))',
-    ]
-    for text in haystacks:
-        candidate = _extract_specific_phrase(text, patterns)
-        if candidate and _looks_specific_deliverable(candidate):
-            return candidate
-
-    _, text_lower = _combined_signal_text(opp)
-    for keywords, deliverable in PHASE2_DELIVERABLE_HINTS:
-        if any(keyword in text_lower for keyword in keywords):
-            return deliverable
-    return ''
-
-
-def _extract_target_user(opp: Opportunity, profile: Optional[dict]) -> str:
-    haystack = ' '.join([opp.description or '', opp.summary or ''])
-    patterns = [
-        r'目标用户为([^。；\n]+)',
-        r'目标用户是([^。；\n]+)',
-        r'面向([^。；\n]+)',
-        r'目标客户为([^。；\n]+)',
-        r'target users? (?:are|is)\s+([^.;\n]+)',
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, haystack, re.IGNORECASE)
-        if match:
-            candidate = _truncate(match.group(1), limit=60)
-            if candidate:
-                return candidate
-    if profile:
-        return profile['default_target']
-    tags = {tag.lower() for tag in opp.tags or []}
-    if 'b2b' in tags:
-        return '有明确业务流程痛点的 B2B 团队负责人'
-    if 'b2c' in tags:
-        return '高频使用该场景、愿意先付费试用的重度个人用户'
-    return '对这个问题已经在用手工流程兜底的人'
-
-
-def _is_generic_acquisition_text(text: str) -> bool:
-    normalized = _clean_text(text).lower()
-    if not normalized:
-        return True
-    has_specific = any(token in normalized for token in PHASE2_SPECIFIC_ACQUISITION_TERMS)
-    generic_hits = [token for token in PHASE2_GENERIC_ACQUISITION_TERMS if token in normalized]
-    return bool(generic_hits) and not has_specific
-
-
-def _has_specific_acquisition_text(text: str) -> bool:
-    return _acquisition_specificity_level(text) >= 2
-
-
-def _acquisition_specificity_level(text: str) -> int:
-    normalized = _clean_text(text).lower()
-    if not normalized:
-        return 0
-    if _is_generic_acquisition_text(text):
-        return 0
-
-    specific_hits = sum(1 for token in PHASE2_SPECIFIC_ACQUISITION_TERMS if token in normalized)
-    vague_hits = sum(1 for token in PHASE2_VAGUE_ACQUISITION_TERMS if token in normalized)
-    named_community = bool(re.search(r'r/[a-z0-9_]+|github|reddit|hacker news|indie hackers|shopify|stripe|slack|discord|微信群|论坛', normalized))
-    countable_targets = bool(re.search(r'(前|首批|先找)\s*\d{1,3}\s*(个)?(用户|客户|团队|公司|商家|founders?|teams?|companies?)', normalized))
-
-    if (specific_hits >= 2) or (specific_hits >= 1 and (named_community or countable_targets)):
-        return 2
-    if countable_targets and not vague_hits:
-        return 1
-    if len(normalized) >= 30 and specific_hits >= 1 and vague_hits == 0:
-        return 1
-    return 0
-
-
-def _is_generic_action_plan(text: str) -> bool:
-    normalized = _clean_text(text).lower()
-    if not normalized:
-        return True
-    generic_hit = any(token.lower() in normalized for token in PHASE2_GENERIC_PLAN_TERMS)
-    concrete_hit = any(token.lower() in normalized for token in PHASE2_CONCRETE_PLAN_TERMS)
-    if generic_hit and not concrete_hit:
-        return True
-    return not concrete_hit and len(normalized) < 24
-
-
-def _default_first_users_source(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
-    source = (opp.source or '').lower()
-    mapping = {
-        'hn': '从 Hacker News 原帖作者、评论区高互动用户和相关 Show HN 创作者里定向外联。',
-        'ph': '从 Product Hunt 发布页评论者、投票用户和同类产品的早期支持者里找首批试用者。',
-        'reddit': '从对应 subreddit 的发帖者、评论者和求推荐帖子里私信约访。',
-        'reddit_r/saas': '从 r/SaaS 的发帖者、评论者和求工具帖里私信约访。',
-        'reddit_pain': '从 Reddit 痛点帖子的发帖者、评论者和同类抱怨帖里直接约访，这些人已经表达了明确不满。',
-        'saas_reviews': '从差评用户、竞品差评区和同类不满评论者里定向触达，这些人已经在为类似方案付费。',
-        'appstore_reviews': '从对应 App 的差评用户、竞品差评区和评论里提到的替代方案用户中定向约访。',
-        'github': '从相关仓库的 issue、discussion、star 用户和 README 反馈里找早期用户。',
-        'github_trending': '从相关仓库的 issue、discussion、star 用户和 README 反馈里找早期用户。',
-        'github_issues': '从对应仓库的 issue 提交者、评论者和相关集成服务商客户里定向约访。',
-        'indiehackers': '从 IndieHackers 发帖作者、评论区和同类项目创始人网络中直接约访。',
-        '36kr': '从报道里出现的赛道从业者、微信群和相关服务商客户名单中做定向外联。',
-        'huxiu': '从报道里出现的赛道从业者、微信群和相关服务商客户名单中做定向外联。',
-    }
-    if assessment and assessment.first_users_hint:
-        return assessment.first_users_hint + '。'
-    return mapping.get(source, '从原始信号对应的社区、评论区和现有人脉里做定向外联，先拿到 20 个深访/试用用户。')
-
-
-def _build_phase2_assessment(opp: Opportunity) -> ScreeningAssessment:
-    _, text_lower = _combined_signal_text(opp)
-    profile = _pick_phase2_profile(text_lower)
-    target_user = _extract_target_user(opp, profile)
-    trigger_candidate = _extract_trigger_candidate(opp)
-    deliverable_candidate = _extract_deliverable_candidate(opp)
-    trigger_event = trigger_candidate or (profile['trigger'] if profile else '用户最着急解决这个问题时')
-    deliverable = deliverable_candidate or (profile['deliverable'] if profile else '一个单点可收费结果')
-    avoid_label = profile['avoid_label'] if profile else f'一个泛化复制“{opp.title}”的产品'
-    first_users_hint = profile['first_users_hint'] if profile else ''
-
-    raw_score = int(opp.score or 0)
-    adjusted_score = raw_score
-    evidence_score = 0
-    strengths: List[str] = []
-    keep_gaps: List[str] = []
-    crowded_hits: List[str] = []
-    frontline_hits: List[str] = []
-    heavy_delivery_hits: List[str] = []
-    platform_dependency_hits: List[str] = []
-    kill_reasons: List[str] = []
-
-    if _is_fast_payback_window(opp.time_to_revenue):
-        evidence_score += 2
-        adjusted_score += 6
-        strengths.append(f'见钱周期已压到 {opp.time_to_revenue}')
-    elif _is_medium_payback_window(opp.time_to_revenue):
-        keep_gaps.append('给出的见钱周期仍是 30 天量级，离 14 天首单还有距离')
-        adjusted_score -= 9
-    else:
-        keep_gaps.append('没有看到 14 天内能成交的付费窗口')
-        adjusted_score -= 12
-
-    acquisition_level = _acquisition_specificity_level(opp.customer_acquisition)
-    if acquisition_level >= 2:
-        evidence_score += 2
-        adjusted_score += 5
-        strengths.append('前 20 个用户来源相对具体')
-    elif acquisition_level == 1:
-        keep_gaps.append('首批用户来源写了方向，但还没有具体到马上可开找的帖子、评论者或客户名单')
-        adjusted_score -= 4
-    else:
-        keep_gaps.append('首批用户来源还停留在泛渠道词，没有变成可执行名单')
-        adjusted_score -= 9
-
-    if deliverable_candidate or trigger_candidate:
-        evidence_score += 1
-        adjusted_score += 4
-        strengths.append(f'切口已经压到“{_truncate(deliverable, limit=36)}”这类可收费结果')
-    elif profile:
-        evidence_score += 1
-        adjusted_score += 3
-        strengths.append(f'目标切口至少落在“{profile["category_label"]}”这个具体工作流上')
-    else:
-        keep_gaps.append('机会描述仍然太宽，像类目词，不像一个可先收钱的窄工作流')
-        adjusted_score -= 8
-
-    if opp.startup_cost:
-        startup_cost = _clean_text(opp.startup_cost).lower()
-        if any(token in startup_cost for token in ['<$1k', '$1-5k', '<$5k']):
-            adjusted_score += 3
-            strengths.append(f'启动成本压在 {opp.startup_cost}')
-        elif any(token in startup_cost for token in ['>$20k', '$5-20k']):
-            keep_gaps.append(f'启动成本已经来到 {opp.startup_cost}')
-            adjusted_score -= 7
-
-    if opp.automation_rate:
-        auto_text = _clean_text(opp.automation_rate).lower()
-        if '90' in auto_text:
-            adjusted_score += 2
-            strengths.append(f'可自动化比例达到 {opp.automation_rate}')
-        elif '50' in auto_text:
-            adjusted_score -= 3
-
-    if opp.action_plan:
-        if _is_generic_action_plan(opp.action_plan):
-            keep_gaps.append('第一步仍然是“先做 MVP 再迭代”式模板话，没有落到首单交付动作')
-            adjusted_score -= 8
-        else:
-            evidence_score += 1
-            adjusted_score += 4
-            strengths.append('首单动作已经落到可执行交付')
-    else:
-        keep_gaps.append('没有写清 7-14 天内怎么拿首单')
-        adjusted_score -= 8
-
-    source = (opp.source or '').lower()
-    source_quality = SOURCE_QUALITY.get(source, 'hype')
-    source_delta = SOURCE_QUALITY_SCORE.get(source_quality, 0)
-    adjusted_score += source_delta
-    if source_quality == 'pain':
-        evidence_score += 2
-        strengths.append(f'{opp.source} 是真实用户痛点信号源')
-    elif source_quality == 'discussion':
-        evidence_score += 1
-        strengths.append(f'{opp.source} 更接近真实需求现场')
-    elif source_quality == 'story':
-        if re.search(r'\$\d|mrr', (opp.title or '').lower()):
-            keep_gaps.append('这是成功案例信号，不是未满足需求本身')
-            adjusted_score -= 3
-    elif source_quality in ('hype', 'news'):
-        if source == 'hn' and any(term in text_lower for term in ['how i', 'show hn', 'essay']):
-            keep_gaps.append('这是经验分享/展示，不是用户催着付钱的强需求信号')
-            adjusted_score -= 4
-        elif source_quality == 'news':
-            keep_gaps.append('媒体报道更像行业观察，不足以直接证明首单需求')
-
-    if profile and profile.get('crowded'):
-        crowded_hits.append(profile['category_label'])
-        adjusted_score -= 14
-
-    broad_market_hits = _match_terms(text_lower, ['project management', 'white noise', 'speech to text', 'code generation', 'agent computer', '生产力工具'])
-    for hit in broad_market_hits:
-        label = _normalize_term(hit)
-        if label not in crowded_hits:
-            crowded_hits.append(label)
-    adjusted_score -= min(10, max(0, len(broad_market_hits) - 1) * 4)
-
-    risks_text = _clean_text(opp.risks).lower()
-    for term, label in PHASE2_BIG_PLAYER_TERMS.items():
-        if term in text_lower or term in risks_text:
-            if label not in frontline_hits:
-                frontline_hits.append(label)
-    if any(token in risks_text for token in ['竞争激烈', '大厂', '官方', '自带', '原生']) and frontline_hits:
-        adjusted_score -= 16
-    elif frontline_hits and profile and profile.get('crowded'):
-        adjusted_score -= 12
-
-    heavy_delivery_hits.extend(_match_terms(text_lower, PHASE2_HEAVY_DELIVERY_TERMS))
-    if heavy_delivery_hits:
-        adjusted_score -= 18
-        keep_gaps.append('交付明显偏向重实施/重集成，不像能被单人稳定复制的高毛利模型')
-
-    platform_dependency_hits.extend(_match_terms(risks_text, PHASE2_PLATFORM_DEPENDENCY_TERMS))
-    if platform_dependency_hits:
-        adjusted_score -= 9
-
-    weak_signal_hits = _match_terms(text_lower, PHASE2_SIGNAL_WEAK_TERMS)
-    if weak_signal_hits and source in {'hn', 'ph', 'indiehackers', '36kr', 'huxiu'}:
-        adjusted_score -= 6
-
-    if any(token in text_lower for token in ['all-in-one', '平台', 'suite', 'workspace', '系统']) and not profile:
-        adjusted_score -= 8
-        keep_gaps.append('叙述里还是平台/全家桶语言，没有压缩到单结果交付')
-
-    enrichment_evidence = getattr(opp, 'enrichment_evidence_score', 0) or 0
-    enrichment_competitors = getattr(opp, 'enrichment_competitor_count', 0) or 0
-    enrichment_pain_posts = getattr(opp, 'enrichment_pain_post_count', 0) or 0
-    if enrichment_evidence > 0:
-        adjusted_score += enrichment_evidence
-        evidence_score += min(3, enrichment_evidence // 2)
-    if enrichment_pain_posts >= 5:
-        strengths.append(f'Reddit 上有 {enrichment_pain_posts} 条相关痛点帖，需求信号较强')
-    elif enrichment_pain_posts >= 2:
-        strengths.append(f'Reddit 上有 {enrichment_pain_posts} 条相关痛点帖')
-    if enrichment_competitors == 0:
-        strengths.append('暂未发现直接竞品')
-    elif enrichment_competitors >= 8:
-        keep_gaps.append(f'搜索到 {enrichment_competitors} 个竞品/替代方案，市场已经较拥挤')
-        adjusted_score -= 3
-
-    cross_source_boost = getattr(opp, 'cross_source_boost', 0) or 0
-    if cross_source_boost > 0:
-        adjusted_score += cross_source_boost
-        evidence_score += min(2, cross_source_boost // 4)
-        strengths.append(f'同一痛点在多个独立数据源出现（跨源加分 +{cross_source_boost}）')
-
-    feedback_boost = getattr(opp, 'feedback_boost', 0) or 0
-    if feedback_boost > 0:
-        adjusted_score += feedback_boost
-        evidence_score += 2
-        strengths.append('历史反馈中同类痛点已被验证可行')
-    elif feedback_boost < 0:
-        adjusted_score += feedback_boost
-        keep_gaps.append('历史反馈中同类痛点验证失败过')
-
-    fast_payback = _is_fast_payback_window(opp.time_to_revenue)
-    generic_action_plan = _is_generic_action_plan(opp.action_plan)
-    weak_source_signal = bool(weak_signal_hits) and source in {'hn', 'ph', 'indiehackers', '36kr', 'huxiu'}
-    hard_filter_reasons: List[str] = []
-    if heavy_delivery_hits:
-        hard_filter_reasons.append('交付仍偏重实施/集成，单人模型会被服务化吞掉。')
-    if crowded_hits and frontline_hits:
-        hard_filter_reasons.append('切口仍落在大厂和成熟产品的主战场。')
-    if acquisition_level == 0 and generic_action_plan:
-        hard_filter_reasons.append('首客名单和首单动作都还是模板话，缺少可执行验证路径。')
-    if weak_source_signal and not fast_payback and acquisition_level < 2:
-        hard_filter_reasons.append('信号更像内容/案例热度，不像前线用户在催首单交付。')
-
-    adjusted_score = max(0, min(95, adjusted_score))
-
-    if crowded_hits and frontline_hits:
-        names = '、'.join(frontline_hits[:2])
-        category = profile['category_label'] if profile else '这个类目'
-        kill_reasons.append(f'这是 {category} 的主战场，用户默认会先比较 {names} 这类现成方案；单人新项目很容易被拖进功能和价格战。')
-    elif crowded_hits:
-        category = crowded_hits[0]
-        kill_reasons.append(f'{category} 已经是成熟红海类目，当前信号没有暴露出一个足够锋利、能先收钱的切口。')
-
-    if heavy_delivery_hits:
-        kill_reasons.append('首单也许能靠定制/实施拿下，但交付会持续吞掉创始人时间，不符合一人公司高毛利模型。')
-
-    if platform_dependency_hits and frontline_hits:
-        names = '、'.join(frontline_hits[:2])
-        kill_reasons.append(f'价值链过度挂在 {names} 等平台上，平台补功能或改接口就会削弱你的定价权。')
-
-    if keep_gaps and not _is_fast_payback_window(opp.time_to_revenue):
-        kill_reasons.append('现在更多是“有人会讨论/会注册”，不是“有人会在 14 天内掏钱催你交付”。')
-    kill_reasons.extend(hard_filter_reasons[:2])
-
-    critical_red_flags = bool(heavy_delivery_hits) or (bool(crowded_hits) and bool(frontline_hits))
-    if (
-        adjusted_score >= PHASE2_KEEP_MIN_SCORE
-        and evidence_score >= 5
-        and fast_payback
-        and acquisition_level >= 2
-        and not generic_action_plan
-        and (profile or deliverable_candidate or trigger_candidate)
-        and not critical_red_flags
-        and not hard_filter_reasons
-    ):
-        verdict = 'keep'
-    elif (
-        adjusted_score >= PHASE2_WATCH_MIN_SCORE
-        and evidence_score >= 4
-        and acquisition_level >= 1
-        and not generic_action_plan
-        and (profile or deliverable_candidate or trigger_candidate)
-        and not critical_red_flags
-        and not weak_source_signal
-        and len(crowded_hits) <= 1
-        and len(frontline_hits) <= 1
-        and not hard_filter_reasons
-    ):
-        verdict = 'watch'
-    else:
-        verdict = 'drop'
-
-    return ScreeningAssessment(
-        raw_score=raw_score,
-        adjusted_score=adjusted_score,
-        verdict=verdict,
-        evidence_score=evidence_score,
-        strengths=strengths,
-        keep_gaps=keep_gaps,
-        kill_reasons=kill_reasons,
-        crowded_hits=crowded_hits,
-        frontline_hits=frontline_hits,
-        heavy_delivery_hits=[_normalize_term(hit) for hit in heavy_delivery_hits[:3]],
-        platform_dependency_hits=[_normalize_term(hit) for hit in platform_dependency_hits[:3]],
-        category_label=profile['category_label'] if profile else '',
-        avoid_label=avoid_label,
-        target_user=target_user,
-        trigger_event=trigger_event,
-        deliverable=deliverable,
-        first_users_hint=first_users_hint,
-    )
-
-
-def _opportunity_what(opp: Opportunity) -> str:
-    """项目是做什么（优先 description，其次 summary）。"""
-    base = (opp.description or opp.summary or '').strip()
-    if base:
-        return base
-    return f"围绕 {opp.title} 这个信号，抽象出可产品化场景，面向对应目标用户提供可复用的工具/服务。"
-
-
-def _opportunity_how(opp: Opportunity) -> str:
-    """怎么做（落地路径）。"""
-    if opp.action_plan:
-        return opp.action_plan.strip()
-    return "先做最小可行版本（MVP）→ 找10位种子用户验证 → 根据反馈迭代功能与定价。"
-
-
-def _opportunity_profit(opp: Opportunity) -> str:
-    """怎么盈利（商业模式 + 时间预期）。"""
-    model = (opp.revenue_model or '订阅').strip()
-    ttr = (opp.time_to_revenue or '30天').strip()
-    potential = (opp.monthly_potential or '$10-50k').strip()
-    return f"主要通过【{model}】变现，预计【{ttr}】看到首笔收入，月度潜力区间【{potential}】。"
-
-
-def _wedge_statement(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
-    assessment = assessment or _build_phase2_assessment(opp)
-    target = assessment.target_user or '一小撮已经在手工兜底的人'
-    trigger = assessment.trigger_event or '用户最着急解决问题时'
-    deliverable = assessment.deliverable or '一个单点可收费结果'
-    prefix = f'{target}在{trigger}，先为他们交付“{deliverable}”'
-    if assessment.verdict == 'keep':
-        return f'别做{assessment.avoid_label}，先盯住这一个结果：{prefix}；先用脚本 + 人工兜底把首单卖出去。'
-    if assessment.verdict == 'watch':
-        return f'如果继续跟进，只验证这一刀是否成立：{prefix}。在证据更硬之前，不要扩成{assessment.avoid_label}。'
-    return f'除非能先证明 {prefix}愿意付钱，否则别做{assessment.avoid_label}。'
-
-
-def _phase2_evidence_label(assessment: ScreeningAssessment) -> str:
-    if assessment.verdict == 'keep' or assessment.evidence_score >= 5:
-        return '硬证据较强'
-    if assessment.evidence_score >= 4:
-        return '证据中等'
-    if assessment.evidence_score >= 2:
-        return '证据偏弱'
-    return '证据不足'
-
-
-def _phase2_signal_summary(opp: Opportunity, assessment: ScreeningAssessment) -> str:
-    parts = [_phase2_evidence_label(assessment)]
-    if _is_fast_payback_window(opp.time_to_revenue):
-        parts.append('14 天收钱窗口明确')
-    else:
-        parts.append('14 天收钱窗口不足')
-
-    acquisition_level = _acquisition_specificity_level(opp.customer_acquisition)
-    if acquisition_level >= 2:
-        parts.append('首客名单明确')
-    elif acquisition_level == 1:
-        parts.append('首客名单只有方向')
-    else:
-        parts.append('首客名单缺失')
-
-    if _is_generic_action_plan(opp.action_plan):
-        parts.append('首单动作仍模板化')
-    else:
-        parts.append('首单动作具体')
-    return ' / '.join(parts)
-
-
-def _who_pays_in_14_days(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
-    assessment = assessment or _build_phase2_assessment(opp)
-    model = _clean_text(opp.revenue_model or '一次性 setup fee 或按月订阅')
-    target = assessment.target_user or '最痛的那批用户'
-    deliverable = assessment.deliverable or '一个明确结果'
-    if _is_fast_payback_window(opp.time_to_revenue):
-        return f'最可能先付钱的是 {target} 里刚经历过这个触发场景的人，先卖“{deliverable}”的 {model} 版本。'
-    return f'现在还看不到 14 天内会主动掏钱的买家名单。理论上应先找 {target}，用“{deliverable}”试卖一单，但证据还不够。'
-
-
-def _first_20_users_source(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
-    assessment = assessment or _build_phase2_assessment(opp)
-    acquisition = _clean_text(opp.customer_acquisition)
-    if acquisition and not _is_generic_acquisition_text(acquisition):
-        return acquisition
-    if acquisition:
-        return f'{_default_first_users_source(opp, assessment)} 当前模型只给了“{acquisition}”这类泛渠道词，还不算真正的首客名单。'
-    return _default_first_users_source(opp, assessment)
-
-
-def _why_solo_buildable(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
-    assessment = assessment or _build_phase2_assessment(opp)
-    reasons = []
-    if opp.solo_feasibility:
-        reasons.append(_truncate(opp.solo_feasibility, limit=140))
-    if opp.startup_cost:
-        reasons.append(f"启动成本预估 {opp.startup_cost}")
-    if opp.automation_rate:
-        reasons.append(f"可自动化比例 {opp.automation_rate}")
-    if assessment.strengths:
-        reasons.extend(assessment.strengths[:2])
-    if reasons:
-        return '；'.join(reasons[:3]) + '。'
-    return '先从人工服务 + 轻工具交付起步，单人也能在需求验证期内完成交付。'
-
-
-def _why_not_crushed(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
-    assessment = assessment or _build_phase2_assessment(opp)
-    if assessment.frontline_hits:
-        names = '、'.join(assessment.frontline_hits[:2])
-        return f'目前并不存在明确的抗碾压逻辑。只要不把交付压缩成“{assessment.deliverable}”这种单结果，你就会回到和 {names} 正面拼功能的主战场。'
-    if assessment.crowded_hits:
-        category = assessment.category_label or assessment.crowded_hits[0]
-        return f'只有把交付压到“{assessment.deliverable}”这一单结果，才可能避开 {category} 的功能清单战争。'
-    risk = _truncate(opp.risks, limit=120)
-    base = '这是一个足够窄的工作流，先靠速度、人工兜底和场景理解收钱，通常不值得大玩家立刻下场复制。'
-    if risk:
-        return f"{base} 当前最需要防的是 {risk}"
-    return base
-
-
-def _smallest_paid_mvp(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
-    assessment = assessment or _build_phase2_assessment(opp)
-    plan = _clean_text(opp.action_plan)
-    deliverable = assessment.deliverable or '一个单点结果'
-    target = assessment.target_user or '首批目标用户'
-    model = _clean_text(opp.revenue_model or '一次性服务费')
-    if plan:
-        return f'先卖一个只交付“{deliverable}”的 {model} 试点，目标客户锁定为 {target}。落地路径：{_truncate(plan, limit=180)}'
-    return f'先卖一个只承诺“{deliverable}”的 {model} 试点，先用表单/脚本/人工兜底把首单交付出来。'
-
-
-def _high_frequency_scenario(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
-    assessment = assessment or _build_phase2_assessment(opp)
-    return assessment.trigger_event or '用户开始用人工流程兜底这个问题时'
-
-
-def _current_alternative(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
-    assessment = assessment or _build_phase2_assessment(opp)
-    if assessment.frontline_hits:
-        names = '、'.join(assessment.frontline_hits[:2])
-        return f'人工流程、Excel/表单，加上 {names} 这类通用或原生方案。'
-    if assessment.category_label:
-        return f'人工流程、Excel/表单，以及泛 {assessment.category_label} 工具。'
-    return '人工流程、Excel/表单和零散脚本。'
-
-
-def _why_existing_solution_bad(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
-    assessment = assessment or _build_phase2_assessment(opp)
-    if assessment.frontline_hits:
-        names = '、'.join(assessment.frontline_hits[:2])
-        return f'{names} 这类方案更偏通用平台，不会只为“{assessment.deliverable}”这个单结果优化；用户最后还是得自己补人工。'
-    if assessment.crowded_hits:
-        return f'现有替代方案大多覆盖泛需求，不会围绕“{assessment.deliverable}”这个触发场景给出可直接付费的单点交付。'
-    return f'现有替代方案要么太泛，要么还是人工兜底，没把“{assessment.deliverable}”压成可直接购买的结果。'
-
-
-def _why_now_worth_doing(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
-    assessment = assessment or _build_phase2_assessment(opp)
-    reasons = list(assessment.strengths[:2])
-    if opp.source:
-        reasons.append(f'信号直接来自 {opp.source} 的前线讨论')
-    if not reasons:
-        reasons.append('这个问题已经逼着用户在真实工作流里找临时解法')
-    return '；'.join(reasons[:3]) + '。'
-
-
-def _why_fit_for_user(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
-    assessment = assessment or _build_phase2_assessment(opp)
-    target = assessment.target_user or '这批用户'
-    scenario = assessment.trigger_event or '问题爆发时'
-    deliverable = assessment.deliverable or '这个结果'
-    return f'{target} 会在 {scenario} 立刻感受到损失或延误；只要你直接交付“{deliverable}”，他们不需要先改流程就能试用。'
-
-
-def _do_not_scale_boundary(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
-    assessment = assessment or _build_phase2_assessment(opp)
-    not_crushed = _why_not_crushed(opp, assessment)
-    return f'别做 {assessment.avoid_label}。{not_crushed}'
-
-
-def _final_conclusion(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
-    assessment = assessment or _build_phase2_assessment(opp)
-    action = _decision_label(opp.score, assessment.verdict)
-    if assessment.verdict == 'keep':
-        return f'{action}。先把“{assessment.deliverable}”卖给最先痛的那批 {assessment.target_user}，不要扩成功能平台。'
-    if assessment.verdict == 'watch':
-        return f'{action}。先验证 {assessment.target_user} 是否愿意为“{assessment.deliverable}”留下联系方式或预约沟通，再决定要不要做 7 天 MVP。'
-    return f'{action}。{_filtered_reason(opp, assessment)}'
-
-
-def _primary_candidate(kept: List[Opportunity], watchlist: List[Opportunity]) -> tuple[Optional[Opportunity], List[Opportunity]]:
-    if kept:
-        return kept[0], watchlist
-    if watchlist:
-        return watchlist[0], watchlist[1:]
-    return None, []
-
-
-def _unique_candidate_card_lines(opp: Opportunity, assessment: ScreeningAssessment) -> List[str]:
-    return [
-        '## 今日唯一候选',
-        f'- 切口名称: {assessment.deliverable}',
-        f'- 目标用户: {assessment.target_user}',
-        f'- 高频场景: {_high_frequency_scenario(opp, assessment)}',
-        f'- 当前替代方案: {_current_alternative(opp, assessment)}',
-        f'- 为什么现有方案不好: {_why_existing_solution_bad(opp, assessment)}',
-        f'- 为什么现在值得做: {_why_now_worth_doing(opp, assessment)}',
-        f'- 为什么适合用户: {_why_fit_for_user(opp, assessment)}',
-        f'- 6 周最小收费版本: {_smallest_paid_mvp(opp, assessment)}',
-        f'- 首批 20 用户从哪里来: {_first_20_users_source(opp, assessment)}',
-        f'- 验证动作（landing page / 7 day MVP / 丢弃）: **{_decision_label(opp.score, assessment.verdict)}**',
-        f'- 不该做大的边界: {_do_not_scale_boundary(opp, assessment)}',
-        f'- 最终结论: {_final_conclusion(opp, assessment)}',
-        f'- 来源: `{opp.source}`',
-        f'- 链接: {opp.url}',
-        '',
-    ]
-
-
-def _filtered_reason(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
-    assessment = assessment or _build_phase2_assessment(opp)
-    reasons = list(assessment.kill_reasons[:2])
-    if not reasons and assessment.keep_gaps:
-        reasons.append(assessment.keep_gaps[0])
-    if not reasons:
-        reasons.append('当前更像泛机会，不是今天就该切进去的 wedge。')
-    if len(reasons) < 2 and len(assessment.keep_gaps) > 1:
-        reasons.append(assessment.keep_gaps[1])
-    return ' '.join(reasons[:2])
-
-
-def _pseudo_opportunity_type(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
-    assessment = assessment or _build_phase2_assessment(opp)
-    if assessment.category_label:
-        return f'{assessment.category_label}型机会'
-    if assessment.deliverable:
-        return f'{_truncate(assessment.deliverable, limit=28)}型机会'
-    if opp.title:
-        return f'{_truncate(opp.title, limit=28)}型机会'
-    return '泛机会'
-
-
-def _concise_drop_reason(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
-    assessment = assessment or _build_phase2_assessment(opp)
-    if assessment.kill_reasons:
-        return _truncate(assessment.kill_reasons[0], limit=72)
-    if assessment.keep_gaps:
-        return _truncate(assessment.keep_gaps[0], limit=72)
-    return '今天看不到值得继续验证的付费与分发证据。'
-
-
-def _not_worth_doing_lines(dropped: List[Opportunity], assessments: dict) -> List[str]:
-    lines: List[str] = []
-    for opp in dropped[:5]:
-        assessment = assessments.get(opp.id) or _build_phase2_assessment(opp)
-        lines.append(
-            f'- {_pseudo_opportunity_type(opp, assessment)}: {_concise_drop_reason(opp, assessment)}'
-        )
-
-    fallback_lines = [
-        '- 泛流量故事型机会: 缺少 14 天内谁会先付钱的明确信号，今天继续看只会放大自我感动。',
-        '- 大厂主战场型机会: 没有更窄的结果交付切口，进入就是和平台能力硬碰硬。',
-        '- 泛需求工具型机会: 首批 20 用户名单与触达动作不具体，今天不值得继续投入。',
-        '- 重交付服务型机会: 一开始就要靠长期定制才能成立，不符合一人快速验证边界。',
-        '- 证据不足型机会: 讨论热度可以保留观察，但不到今天就该升级验证的程度。',
-    ]
-    if len(lines) < 3:
-        for fallback in fallback_lines:
-            if fallback not in lines:
-                lines.append(fallback)
-            if len(lines) >= 3:
-                break
-    return lines[:5]
-
-
-def _daily_rule_adjustment(opportunities: List[Opportunity], assessments: Optional[dict] = None) -> Dict[str, str]:
-    assessments = assessments or {opp.id: _build_phase2_assessment(opp) for opp in opportunities}
-
-    if not opportunities:
-        return {
-            'suggestion': '继续把“14 天内能收钱 + 首批 20 用户来源具体”当作硬门槛，不因为样本少就放松。',
-            'evidence': '今天没有新的候选样本，当前最稳的做法仍然是先守住付费窗口和首客名单这两条线。',
-        }
-
-    candidates: List[Dict[str, Any]] = []
-
-    def _pick_rule(key: str, hits: List[Opportunity], suggestion: str, evidence_builder) -> None:
-        if not hits:
-            return
-        candidates.append({
-            'key': key,
-            'hits': len(hits),
-            'suggestion': suggestion,
-            'evidence': evidence_builder(hits),
-        })
-
-    generic_acquisition_hits = [
-        opp for opp in opportunities
-        if _acquisition_specificity_level(opp.customer_acquisition) == 0
-    ]
-    _pick_rule(
-        'generic_acquisition',
-        generic_acquisition_hits,
-        '把“首批 20 用户来源仍是 SEO / 社媒 / 泛 cold outreach”的机会直接降为丢弃，不再给继续观察名额。',
-        lambda hits: f'今天有 {len(hits)} 条样本的首客来源仍停留在泛渠道词，最典型的是「{hits[0].title}」。',
-    )
-
-    generic_plan_hits = [
-        opp for opp in opportunities
-        if _is_generic_action_plan(opp.action_plan)
-    ]
-    _pick_rule(
-        'generic_plan',
-        generic_plan_hits,
-        '把“第一步还是先做 MVP 再迭代”的机会再降一档，除非同时给出可收费交付和具体客户名单。',
-        lambda hits: f'今天有 {len(hits)} 条样本在首单动作上仍是模板话，继续保留只会稀释验证精力。',
-    )
-
-    crowded_frontline_hits = [
-        opp for opp in opportunities
-        if (assessments.get(opp.id) or _build_phase2_assessment(opp)).crowded_hits
-        and (assessments.get(opp.id) or _build_phase2_assessment(opp)).frontline_hits
-    ]
-    _pick_rule(
-        'crowded_frontline',
-        crowded_frontline_hits,
-        '把“落在大厂或成熟产品主战场”的机会直接过滤，不再给 watch 名额。',
-        lambda hits: f'今天有 {len(hits)} 条样本同时踩中红海类目和平台原生能力，最典型的是「{hits[0].title}」。',
-    )
-
-    weak_story_source_hits = [
-        opp for opp in opportunities
-        if (
-            (assessments.get(opp.id) or _build_phase2_assessment(opp)).verdict == 'drop'
-            and (opp.source or '').lower() in {'hn', 'ph', 'indiehackers', '36kr', 'huxiu', 'tiehan'}
-            and not _is_fast_payback_window(opp.time_to_revenue)
-        )
-    ]
-    _pick_rule(
-        'weak_story_source',
-        weak_story_source_hits,
-        '把“成功案例 / 媒体报道 / Show HN”默认当背景噪音，除非同时给出 14 天收钱窗口和具体外联名单。',
-        lambda hits: f'今天有 {len(hits)} 条样本来源更像故事或报道，而不是用户催着付钱的前线信号。',
-    )
-
-    heavy_delivery_hits = [
-        opp for opp in opportunities
-        if (assessments.get(opp.id) or _build_phase2_assessment(opp)).heavy_delivery_hits
-    ]
-    _pick_rule(
-        'heavy_delivery',
-        heavy_delivery_hits,
-        '把“需要长期实施 / 集成 / 定制交付”的机会直接判掉，别让服务化题目挤占验证名额。',
-        lambda hits: f'今天有 {len(hits)} 条样本一开始就要求重交付，单人模型很难复制扩张。',
-    )
-
-    if candidates:
-        priority = {
-            'generic_acquisition': 5,
-            'crowded_frontline': 4,
-            'generic_plan': 3,
-            'weak_story_source': 2,
-            'heavy_delivery': 1,
-        }
-        best = max(candidates, key=lambda item: (item['hits'], priority.get(item['key'], 0)))
-        return {
-            'suggestion': best['suggestion'],
-            'evidence': best['evidence'],
-        }
-
-    keep_exceptions = [
-        opp for opp in opportunities
-        if (
-            (assessments.get(opp.id) or _build_phase2_assessment(opp)).verdict in {'keep', 'watch'}
-            and (opp.source or '').lower() in {'hn', 'ph', 'indiehackers', '36kr', 'huxiu', 'tiehan'}
-            and _acquisition_specificity_level(opp.customer_acquisition) >= 2
-            and not _is_generic_action_plan(opp.action_plan)
-            and _is_fast_payback_window(opp.time_to_revenue)
-        )
-    ]
-    if keep_exceptions:
-        sample = keep_exceptions[0]
-        return {
-            'suggestion': '别按来源一刀切丢掉 HN / IndieHackers / 媒体信号；只要同时满足 14 天收钱窗口和具体首客名单，允许继续跟进。',
-            'evidence': f'今天至少有 1 条这类例外样本成立，代表案例是「{sample.title}」。',
-        }
-
-    return {
-        'suggestion': '继续把“14 天内能收钱 + 首批 20 用户来源具体”当作 keep 前置条件，本轮没有足够证据支持放松。',
-        'evidence': '今天的样本没有形成单一新模式，先守住现有硬门槛比频繁改规则更稳。',
-    }
-
-
-def _annotate_phase2_assessments(opportunities: List[Opportunity]) -> dict:
-    assessments = {}
-    for opp in opportunities:
-        assessment = _build_phase2_assessment(opp)
-        assessments[opp.id] = assessment
-        opp.phase2_adjusted_score = assessment.adjusted_score
-        opp.phase2_decision_label = _decision_label(assessment.adjusted_score, assessment.verdict)
-        opp.phase2_verdict = assessment.verdict
-        opp.phase2_wedge = _wedge_statement(opp, assessment)
-        opp.phase2_who_pays = _who_pays_in_14_days(opp, assessment)
-        opp.phase2_first_users = _first_20_users_source(opp, assessment)
-        opp.phase2_solo_logic = _why_solo_buildable(opp, assessment)
-        opp.phase2_not_crushed = _why_not_crushed(opp, assessment)
-        opp.phase2_paid_mvp = _smallest_paid_mvp(opp, assessment)
-        opp.phase2_target_user = assessment.target_user
-        opp.phase2_trigger_event = assessment.trigger_event
-        opp.phase2_deliverable = assessment.deliverable
-        opp.phase2_current_alternative = _current_alternative(opp, assessment)
-        opp.phase2_why_existing_bad = _why_existing_solution_bad(opp, assessment)
-        opp.phase2_why_now = _why_now_worth_doing(opp, assessment)
-        opp.phase2_why_fit_for_user = _why_fit_for_user(opp, assessment)
-        opp.phase2_boundary = _do_not_scale_boundary(opp, assessment)
-        opp.phase2_final_conclusion = _final_conclusion(opp, assessment)
-        opp.phase2_filtered_reason = _filtered_reason(opp, assessment)
-        opp.phase2_raw_score = assessment.raw_score
-        opp.phase2_evidence_score = assessment.evidence_score
-        opp.score = assessment.adjusted_score
-    return assessments
-
-
-def _bucket_phase2_candidates(opportunities: List[Opportunity], assessments: Optional[dict] = None) -> tuple[List[Opportunity], List[Opportunity], List[Opportunity]]:
-    assessments = assessments or {opp.id: _build_phase2_assessment(opp) for opp in opportunities}
-    kept: List[Opportunity] = []
-    watchlist: List[Opportunity] = []
-    dropped: List[Opportunity] = []
-    for opp in opportunities:
-        assessment = assessments.get(opp.id)
-        verdict = assessment.verdict if assessment else 'drop'
-        if verdict == 'keep' and not kept:
-            kept.append(opp)
-        elif verdict == 'watch' and len(watchlist) < PHASE2_WATCH_LIMIT:
-            watchlist.append(opp)
-        elif verdict != 'keep' and len(dropped) < PHASE1_FILTER_LIMIT:
-            dropped.append(opp)
-    return kept, watchlist, dropped
-
-
-def _agent_reach_health_summary_lines() -> List[str]:
-    health_summary_lines = []
-    health_file = os.path.join(DATA_DIR, 'agent_reach_health.json')
-    if not os.path.exists(health_file):
-        return health_summary_lines
-
-    try:
-        h = json.load(open(health_file, 'r', encoding='utf-8'))
-        platforms = h.get('platforms', {})
-        health_summary_lines.append('## 每日健康摘要（Agent Reach）')
-        for name in ('x', 'youtube', 'reddit'):
-            p = platforms.get(name, {})
-            healthy = bool(p.get('healthy', False))
-            failures = int(p.get('failures', 0) or 0)
-            cooldown = p.get('cooldown_until') or ''
-            status = '可用' if healthy else '不可用'
-            if cooldown:
-                status += f'（熔断至 {cooldown}）'
-            health_summary_lines.append(f'- {name}: {status} | 连续失败: {failures}')
-        health_summary_lines.append('')
-    except Exception as e:
-        health_summary_lines.append('## 每日健康摘要（Agent Reach）')
-        health_summary_lines.append(f'- 读取失败: {e}')
-        health_summary_lines.append('')
-    return health_summary_lines
-
-
-def _snapshot_datetime_from_name(name: str) -> Optional[datetime]:
-    match = re.match(r'^opportunities_(\d{8})_(\d{6})\.json$', name)
-    if not match:
-        return None
-    try:
-        return datetime.strptime(match.group(1) + match.group(2), '%Y%m%d%H%M%S')
-    except ValueError:
-        return None
-
-
-def _restore_opportunity_from_dict(data: Dict[str, Any]) -> Opportunity:
-    created_at_raw = data.get('created_at')
-    created_at = datetime.now()
-    if isinstance(created_at_raw, str):
+# ---------------------------------------------------------------------------
+# Data persistence
+# ---------------------------------------------------------------------------
+
+def save_results(opportunities: List[Opportunity]):
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    json_file = os.path.join(DATA_DIR, f"opportunities_{timestamp}.json")
+    with open(json_file, 'w', encoding='utf-8') as f:
         try:
-            created_at = datetime.fromisoformat(created_at_raw)
-        except ValueError:
-            created_at = datetime.now()
-
-    opp = Opportunity(
-        id=str(data.get('id', '')),
-        title=data.get('title', '') or '',
-        source=data.get('source', '') or '',
-        url=data.get('url', '') or '',
-        score=int(data.get('phase2_raw_score', data.get('score', 0)) or 0),
-        summary=data.get('summary', '') or '',
-        description=data.get('description', '') or '',
-        solo_feasibility=data.get('solo_feasibility', '') or '',
-        agent_roles=list(data.get('agent_roles', []) or []),
-        startup_cost=data.get('startup_cost', '') or '',
-        time_to_revenue=data.get('time_to_revenue', '') or '',
-        revenue_model=data.get('revenue_model', '') or '',
-        monthly_potential=data.get('monthly_potential', '') or '',
-        automation_rate=data.get('automation_rate', '') or '',
-        customer_acquisition=data.get('customer_acquisition', '') or '',
-        risks=data.get('risks', '') or '',
-        action_plan=data.get('action_plan', '') or '',
-        tags=list(data.get('tags', []) or []),
-        source_url=data.get('source_url', '') or '',
-        research_links=list(data.get('research_links', []) or []),
-        created_at=created_at,
-    )
-
-    for field_name in (
-        'phase2_adjusted_score',
-        'phase2_decision_label',
-        'phase2_verdict',
-        'phase2_wedge',
-        'phase2_who_pays',
-        'phase2_first_users',
-        'phase2_solo_logic',
-        'phase2_not_crushed',
-        'phase2_paid_mvp',
-        'phase2_target_user',
-        'phase2_trigger_event',
-        'phase2_deliverable',
-        'phase2_current_alternative',
-        'phase2_why_existing_bad',
-        'phase2_why_now',
-        'phase2_why_fit_for_user',
-        'phase2_boundary',
-        'phase2_final_conclusion',
-        'phase2_filtered_reason',
-        'phase2_raw_score',
-        'phase2_evidence_score',
-    ):
-        if field_name in data:
-            setattr(opp, field_name, data.get(field_name))
-    return opp
-
-
-def _load_snapshot_records(window_days: int = 7, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
-    ref_now = now or datetime.now()
-    cutoff = ref_now - timedelta(days=max(1, window_days))
-    snapshot_files: List[tuple[datetime, str]] = []
-
-    if not os.path.exists(DATA_DIR):
-        return []
-
-    for name in os.listdir(DATA_DIR):
-        snapshot_at = _snapshot_datetime_from_name(name)
-        if not snapshot_at or snapshot_at < cutoff:
-            continue
-        snapshot_files.append((snapshot_at, os.path.join(DATA_DIR, name)))
-
-    snapshot_files.sort(key=lambda item: item[0])
-    records: List[Dict[str, Any]] = []
-    for snapshot_at, path in snapshot_files:
-        try:
-            with open(path, 'r', encoding='utf-8') as fh:
-                payload = json.load(fh)
-        except Exception:
-            continue
-        if not isinstance(payload, list):
-            continue
-        for raw in payload:
-            if not isinstance(raw, dict):
-                continue
-            opp = _restore_opportunity_from_dict(raw)
-            assessment = _build_phase2_assessment(opp)
-            records.append({
-                'snapshot_at': snapshot_at,
-                'snapshot_day': snapshot_at.strftime('%Y-%m-%d'),
-                'path': path,
-                'opp': opp,
-                'assessment': assessment,
-                'fingerprint': _fingerprint_opportunity(opp),
-            })
-    return records
-
-
-def _weekly_focus_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return [
-        record for record in records
-        if record['assessment'].verdict in {'keep', 'watch'}
-        or record['assessment'].adjusted_score >= PHASE2_WATCH_MIN_SCORE
-        or record['assessment'].evidence_score >= 4
-    ]
-
-
-def _weekly_pain_label(assessment: ScreeningAssessment) -> str:
-    return _clean_text(assessment.trigger_event or assessment.deliverable or assessment.category_label or '用户最着急解决这个问题时')
-
-
-def _summarize_weekly_clusters(records: List[Dict[str, Any]], label_fn, reason_fn, limit: int = 3) -> List[Dict[str, Any]]:
-    buckets: Dict[str, Dict[str, Any]] = {}
-    for record in records:
-        opp = record['opp']
-        assessment = record['assessment']
-        label = _clean_text(label_fn(opp, assessment))
-        if not label:
-            continue
-        key = label.lower()
-        bucket = buckets.setdefault(key, {
-            'label': label,
-            'count': 0,
-            'days': set(),
-            'sources': set(),
-            'reasons': [],
-            'sample_title': opp.title,
-        })
-        bucket['count'] += 1
-        bucket['days'].add(record['snapshot_day'])
-        if opp.source:
-            bucket['sources'].add(opp.source)
-        reason = _clean_text(reason_fn(opp, assessment))
-        if reason:
-            bucket['reasons'].append(reason)
-
-    ranked = sorted(
-        buckets.values(),
-        key=lambda item: (item['count'], len(item['days']), len(item['sources'])),
-        reverse=True,
-    )
-    return ranked[:limit]
-
-
-def _best_weekly_direction(records: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    if not records:
-        return None
-
-    groups: Dict[str, Dict[str, Any]] = {}
-    for record in records:
-        opp = record['opp']
-        assessment = record['assessment']
-        group_key = '|'.join([
-            _clean_text(assessment.deliverable).lower(),
-            _clean_text(assessment.target_user).lower(),
-        ])
-        if not group_key.strip('|'):
-            continue
-        group = groups.setdefault(group_key, {
-            'records': [],
-            'days': set(),
-            'sources': set(),
-            'keep': 0,
-            'watch': 0,
-            'score_total': 0,
-            'evidence_total': 0,
-        })
-        group['records'].append(record)
-        group['days'].add(record['snapshot_day'])
-        if opp.source:
-            group['sources'].add(opp.source)
-        if assessment.verdict == 'keep':
-            group['keep'] += 1
-        elif assessment.verdict == 'watch':
-            group['watch'] += 1
-        group['score_total'] += assessment.adjusted_score
-        group['evidence_total'] += assessment.evidence_score
-
-    if not groups:
-        return None
-
-    def _group_score(group: Dict[str, Any]) -> float:
-        count = max(1, len(group['records']))
-        avg_score = group['score_total'] / count
-        avg_evidence = group['evidence_total'] / count
-        return (
-            group['keep'] * 8
-            + group['watch'] * 4
-            + len(group['days']) * 2
-            + len(group['sources']) * 1.5
-            + avg_score / 10
-            + avg_evidence
-        )
-
-    best_group = max(groups.values(), key=_group_score)
-    representative = max(
-        best_group['records'],
-        key=lambda item: (
-            item['assessment'].verdict == 'keep',
-            item['assessment'].adjusted_score,
-            item['assessment'].evidence_score,
-        ),
-    )
-    return {
-        'representative': representative,
-        'days': len(best_group['days']),
-        'sources': len(best_group['sources']),
-        'count': len(best_group['records']),
-        'keep': best_group['keep'],
-        'watch': best_group['watch'],
-        'avg_score': round(best_group['score_total'] / max(1, len(best_group['records'])), 1),
-        'avg_evidence': round(best_group['evidence_total'] / max(1, len(best_group['records'])), 1),
-    }
-
-
-def _weekly_direction_confidence(direction: Dict[str, Any]) -> str:
-    if direction['keep'] >= 1 or direction['avg_evidence'] >= 5:
-        return '本周已经出现值得认真验证的单一方向。'
-    if direction['watch'] >= 2 or direction['days'] >= 2:
-        return '证据还没硬到直接开做，但这是本周唯一值得继续压缩验证的问题。'
-    return '证据偏弱，先把这一个方向收窄验证，不要同时追别的题。'
-
-
-def save_weekly_report(window_days: int = 7, now: Optional[datetime] = None) -> Optional[str]:
-    """输出深筛周报（markdown + latest）。"""
-    ref_now = now or datetime.now()
-    ts = ref_now.strftime('%Y%m%d_%H%M%S')
-    report_file = os.path.join(DATA_DIR, f'weekly_report_{ts}.md')
-    latest_file = os.path.join(DATA_DIR, 'latest_weekly.md')
-    records = _load_snapshot_records(window_days=window_days, now=ref_now)
-
-    start_date = (ref_now - timedelta(days=max(1, window_days) - 1)).strftime('%Y-%m-%d')
-    end_date = ref_now.strftime('%Y-%m-%d')
-    snapshot_count = len({record['path'] for record in records})
-    unique_fingerprints = len({record['fingerprint'] for record in records})
-
-    if not records:
-        content = '\n'.join([
-            '# 深筛周报',
-            '',
-            f'- 统计窗口: {start_date} ~ {end_date}',
-            '- 结论: 当前窗口内没有可用历史快照，先继续跑每日模式积累样本。',
-            '',
-            '## 反复出现的痛点',
-            '- 暂无历史样本。',
-            '',
-            '## 重复出现的切口',
-            '- 暂无历史样本。',
-            '',
-            '## 最常见伪机会类型',
-            '- 暂无历史样本。',
-            '',
-            '## 本周唯一值得认真验证的方向',
-            '- 暂无。先继续积累 3-7 天快照，再做深筛归纳。',
-            '',
-        ])
-        with open(report_file, 'w', encoding='utf-8') as fh:
-            fh.write(content)
-        with open(latest_file, 'w', encoding='utf-8') as fh:
-            fh.write(content)
-        print(f'Weekly report saved: {report_file}')
-        return report_file
-
-    focus_records = _weekly_focus_records(records)
-    dropped_records = [record for record in records if record['assessment'].verdict == 'drop']
-    pain_clusters = _summarize_weekly_clusters(
-        focus_records,
-        lambda _opp, assessment: _weekly_pain_label(assessment),
-        lambda _opp, assessment: assessment.target_user,
-        limit=4,
-    )
-    wedge_clusters = _summarize_weekly_clusters(
-        focus_records,
-        lambda _opp, assessment: assessment.deliverable,
-        lambda _opp, assessment: _phase2_signal_summary(_opp, assessment),
-        limit=4,
-    )
-    pseudo_clusters = _summarize_weekly_clusters(
-        dropped_records,
-        lambda opp, assessment: _pseudo_opportunity_type(opp, assessment),
-        lambda opp, assessment: _concise_drop_reason(opp, assessment),
-        limit=4,
-    )
-    direction_candidates = [record for record in focus_records if record['assessment'].verdict in {'keep', 'watch'}]
-    direction = _best_weekly_direction(direction_candidates)
-
-    verdict_counts = defaultdict(int)
-    for record in records:
-        verdict_counts[record['assessment'].verdict] += 1
-
-    lines = [
-        '# 深筛周报',
-        '',
-        f'- 统计窗口: {start_date} ~ {end_date}',
-        f'- 覆盖快照: {snapshot_count} 份',
-        f'- 去重后机会指纹: {unique_fingerprints}',
-        f'- 决策分布: keep {verdict_counts["keep"]} / watch {verdict_counts["watch"]} / drop {verdict_counts["drop"]}',
-        '',
-        '## 反复出现的痛点',
-    ]
-
-    if pain_clusters:
-        for cluster in pain_clusters:
-            sources = '、'.join(sorted(cluster['sources'])[:3]) or '未知来源'
-            lines.append(
-                f'- {cluster["label"]}: {cluster["count"]} 次，出现在 {len(cluster["days"])} 天，主要指向 {sources}。'
-            )
-    else:
-        lines.append('- 本周没有形成可复用的痛点聚类。')
-    lines.append('')
-
-    lines.append('## 重复出现的切口')
-    if wedge_clusters:
-        for cluster in wedge_clusters:
-            reason = cluster['reasons'][0] if cluster['reasons'] else '证据待补充'
-            lines.append(
-                f'- {cluster["label"]}: {cluster["count"]} 次，出现在 {len(cluster["days"])} 天；代表信号是 {reason}。'
-            )
-    else:
-        lines.append('- 本周没有出现重复到值得命名的切口。')
-    lines.append('')
-
-    lines.append('## 最常见伪机会类型')
-    if pseudo_clusters:
-        for cluster in pseudo_clusters:
-            reason = cluster['reasons'][0] if cluster['reasons'] else '今天看不到可执行验证路径。'
-            lines.append(f'- {cluster["label"]}: {cluster["count"]} 次；共性问题是 {reason}')
-    else:
-        lines.append('- 本周 drop 样本不足，暂时没有稳定伪机会类型。')
-    lines.append('')
-
-    lines.append('## 本周唯一值得认真验证的方向')
-    if direction:
-        record = direction['representative']
-        opp = record['opp']
-        assessment = record['assessment']
-        lines.extend([
-            f'- 切口名称: {assessment.deliverable}',
-            f'- 目标用户: {assessment.target_user}',
-            f'- 高频场景: {assessment.trigger_event}',
-            f'- 本周证据: {direction["count"]} 次出现，覆盖 {direction["days"]} 天、{direction["sources"]} 个来源；平均信号 {direction["avg_score"]}，平均证据 {direction["avg_evidence"]}。',
-            f'- 为什么是它: {_weekly_direction_confidence(direction)}',
-            f'- 下周只验证什么: 先验证 {assessment.target_user} 是否愿意为“{assessment.deliverable}”付第一笔钱，不扩成功能平台。',
-            f'- 参考样本: {opp.title} | {opp.url}',
-            '',
-        ])
-    else:
-        lines.extend([
-            '- 暂无。当前窗口里还没有出现一个值得单点加码的方向。',
-            '',
-        ])
-
-    content = '\n'.join(lines)
-    with open(report_file, 'w', encoding='utf-8') as fh:
-        fh.write(content)
-    with open(latest_file, 'w', encoding='utf-8') as fh:
-        fh.write(content)
-
-    print(f'Weekly report saved: {report_file}')
-    return report_file
-
-
-def save_phase1_report(opportunities: List[Opportunity], assessments: Optional[dict] = None, run_notes: Optional[List[str]] = None):
-    """输出 Phase 1 solo-venture screener（markdown + latest）。"""
-    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    report_file = os.path.join(DATA_DIR, f'phase1_report_{ts}.md')
-    latest_file = os.path.join(DATA_DIR, 'latest_phase1.md')
-
-    assessments = assessments or {opp.id: _build_phase2_assessment(opp) for opp in opportunities}
-    kept, watchlist, dropped = _bucket_phase2_candidates(opportunities, assessments)
-    primary, remaining_watchlist = _primary_candidate(kept, watchlist)
-    rule_adjustment = _daily_rule_adjustment(opportunities, assessments)
-    verdict_counts = {'keep': 0, 'watch': 0, 'drop': 0}
-    for opp in opportunities:
-        verdict = assessments[opp.id].verdict
-        verdict_counts[verdict] = verdict_counts.get(verdict, 0) + 1
-    lines = [
-        '# Phase 1 Solo Venture Screener',
-        '',
-        f'- 生成时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}',
-        f'- 候选池规模: {len(opportunities)}',
-        f'- 结论: {_final_conclusion(primary, assessments[primary.id]) if primary else "丢弃。今日没有值得继续验证的切口。"}',
-        f'- 决策分布: keep {verdict_counts["keep"]} / watch {verdict_counts["watch"]} / drop {verdict_counts["drop"]}',
-        '',
-    ]
-    lines.extend(_agent_reach_health_summary_lines())
-    if run_notes:
-        lines.extend(['## Run Notes', *[f'- {note}' for note in run_notes], ''])
-    lines.extend([
-        '## 今日最该调整的一条筛选规则',
-        f'- 建议: {rule_adjustment["suggestion"]}',
-        f'- 依据: {rule_adjustment["evidence"]}',
-        '',
-    ])
-
-    if primary:
-        assessment = assessments[primary.id]
-        lines.extend(_unique_candidate_card_lines(primary, assessment))
-        lines.extend([
-            '## 决策依据',
-            f'- 机会信号: **{_signal_strength_label(primary.score)}**',
-            f'- 证据摘要: **{_phase2_signal_summary(primary, assessment)}**',
-            f'- 14 天内谁会先付钱: {_who_pays_in_14_days(primary, assessment)}',
-            f'- 一人可行性: {_why_solo_buildable(primary, assessment)}',
-            '',
-        ])
-    else:
-        top_gap_lines = []
-        for opp in dropped[:2]:
-            reason = _filtered_reason(opp, assessments.get(opp.id))
-            if reason:
-                top_gap_lines.append(f'- {opp.title}: {reason}')
-        lines.extend([
-            '## 今日唯一候选',
-            f'- 验证动作（landing page / 7 day MVP / 丢弃）: **{FINAL_ACTION_DROP}**',
-            '- 最终结论: 丢弃。今天没有出现值得继续验证的唯一候选。',
-            '',
-            '## 为什么今天没有候选',
-            '缺的不是更高的分数，而是一个同时满足“14 天可收钱 + 首批用户名单明确 + 不正面撞大厂主战场”的切口。',
-            '',
-        ])
-        lines.extend(top_gap_lines)
-        if top_gap_lines:
-            lines.append('')
-
-    if remaining_watchlist:
-        lines.extend([
-            '## 继续观察',
-            '以下机会仍可作为候选池样本，但今天不升级为唯一候选：',
-            '',
-        ])
-        for idx, opp in enumerate(remaining_watchlist, 1):
-            assessment = assessments[opp.id]
-            lines.extend([
-                f'### {idx}. {opp.title}',
-                f'- 验证动作（landing page / 7 day MVP / 丢弃）: **{_decision_label(opp.score, assessment.verdict)}**',
-                f'- 机会信号: **{_signal_strength_label(opp.score)}**',
-                f'- 证据摘要: {_phase2_signal_summary(opp, assessment)}',
-                f'- 最终结论: {_final_conclusion(opp, assessment)}',
-                f'- 链接: {opp.url}',
-                '',
-            ])
-
-    lines.extend([
-        '## 今天不值得做',
-        '以下 3-5 条是今天明确不该继续投入的伪机会判断：',
-        '',
-    ])
-
-    not_worth_lines = _not_worth_doing_lines(dropped, assessments)
-    if not_worth_lines:
-        lines.extend(not_worth_lines)
-        lines.append('')
-    else:
-        lines.extend([
-            '- 无更多可列出的过滤样本。',
-            '',
-        ])
-
-    content = '\n'.join(lines)
-    with open(report_file, 'w', encoding='utf-8') as f:
-        f.write(content)
-    with open(latest_file, 'w', encoding='utf-8') as f:
-        f.write(content)
-
-    print(f'Phase 1 report saved: {report_file}')
-
-
-def save_top10_report(opportunities: List[Opportunity]):
-    """输出 Top10 决策报告（markdown + latest）"""
-    if not opportunities:
-        return
-
-    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    report_file = os.path.join(DATA_DIR, f'top10_report_{ts}.md')
-    latest_file = os.path.join(DATA_DIR, 'latest_top10.md')
-
-    # Agent Reach 健康摘要
-    health_summary_lines = []
-    health_file = os.path.join(DATA_DIR, 'agent_reach_health.json')
-    if os.path.exists(health_file):
-        try:
-            h = json.load(open(health_file, 'r', encoding='utf-8'))
-            platforms = h.get('platforms', {})
-            health_summary_lines.append('## 每日健康摘要（Agent Reach）')
-            for name in ('x', 'youtube', 'reddit'):
-                p = platforms.get(name, {})
-                healthy = bool(p.get('healthy', False))
-                failures = int(p.get('failures', 0) or 0)
-                cooldown = p.get('cooldown_until') or ''
-                status = '可用' if healthy else '不可用'
-                if cooldown:
-                    status += f'（熔断至 {cooldown}）'
-                health_summary_lines.append(f'- {name}: {status} | 连续失败: {failures}')
-            health_summary_lines.append('')
-        except Exception as e:
-            health_summary_lines.append('## 每日健康摘要（Agent Reach）')
-            health_summary_lines.append(f'- 读取失败: {e}')
-            health_summary_lines.append('')
-
-    top = opportunities[:10]
-    lines = [
-        '# Top 10 一人公司机会日报',
-        '',
-        f'- 生成时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}',
-        f'- 样本数量: {len(opportunities)}',
-        '',
-    ]
-    lines.extend(health_summary_lines)
-
-    for idx, o in enumerate(top, 1):
-        lines += [
-            f'## {idx}. {o.title}',
-            f'- 机会信号: **{_signal_strength_label(o.display_score())}**',
-            f'- 验证动作（landing page / 7 day MVP / 丢弃）: **{o.decision_label()}**',
-            f'- 来源: `{o.source}`',
-            f'- 链接: {o.url}',
-            '',
-            f'- 切口名称: {getattr(o, "phase2_deliverable", "") or _opportunity_what(o)}',
-            f'- 目标用户: {getattr(o, "phase2_target_user", "") or "待补充"}',
-            f'- 高频场景: {getattr(o, "phase2_trigger_event", "") or "待补充"}',
-            f'- 6 周最小收费版本: {getattr(o, "phase2_paid_mvp", "") or _opportunity_how(o)}',
-            f'- 最终结论: {getattr(o, "phase2_final_conclusion", "") or o.decision_label()}',
-            '',
-            f'### 关键指标',
-            f'- 一人可行性: {o.solo_feasibility or "待分析"}',
-            f'- 启动成本: {o.startup_cost or "待分析"}',
-            f'- 见钱周期: {o.time_to_revenue or "待分析"}',
-            f'- 收入模式: {o.revenue_model or "待分析"}',
-            f'- 月潜力: {o.monthly_potential or "待分析"}',
-            '',
-        ]
-
-    content = '\n'.join(lines)
-    with open(report_file, 'w', encoding='utf-8') as f:
-        f.write(content)
-    with open(latest_file, 'w', encoding='utf-8') as f:
-        f.write(content)
-
-    print(f'Report saved: {report_file}')
-
-
-def _extract_real_feishu_doc_url(text: str) -> Optional[str]:
-    if not text:
-        return None
-    m = re.search(r'https://(?:[\w-]+\.)?feishu\.cn/docx/[A-Za-z0-9]+', text)
-    return m.group(0) if m else None
-
-
-def _looks_like_placeholder(value: str) -> bool:
-    v = (value or '').strip().lower()
-    return not v or v in {'cli_xxx', 'xxx', 'ou_xxx', 'user_xxx', 'open_id_xxx', 'placeholder'}
-
-
-def _resolve_feishu_credentials() -> tuple[Optional[str], Optional[str]]:
-    app_id = FEISHU_APP_ID
-    app_secret = FEISHU_APP_SECRET
-    if not _looks_like_placeholder(app_id) and not _looks_like_placeholder(app_secret):
-        return app_id, app_secret
-
+            json.dump([opp.to_dict() for opp in opportunities], f, ensure_ascii=False, indent=2)
+        except (TypeError, ValueError):
+            json.dump([{'id': opp.id, 'title': opp.title, 'score': opp.score} for opp in opportunities], f, ensure_ascii=False, indent=2)
+    latest_file = os.path.join(DATA_DIR, "latest.json")
     try:
-        cfg_path = os.path.expanduser('~/.openclaw/openclaw.json')
-        with open(cfg_path, 'r', encoding='utf-8') as f:
-            cfg = json.load(f)
-        acct = (((cfg.get('channels') or {}).get('feishu') or {}).get('accounts') or {}).get('default') or {}
-        app_id = acct.get('appId') or app_id
-        app_secret = acct.get('appSecret') or app_secret
+        with open(latest_file, 'w', encoding='utf-8') as f:
+            json.dump([opp.to_dict() for opp in opportunities], f, ensure_ascii=False, indent=2)
     except Exception:
         pass
-    return app_id, app_secret
-
-
-def _sanitize_secret_text(text: str, secrets: List[str]) -> str:
-    sanitized = text or ''
-    for secret in secrets:
-        if secret:
-            sanitized = sanitized.replace(secret, '***')
-    sanitized = re.sub(r'("app_id":"?)[^",\s]+', r'\1***', sanitized)
-    sanitized = re.sub(r'("app_secret":"?)[^",\s]+', r'\1***', sanitized)
-    return sanitized
-
-
-def _resolve_feishu_runtime() -> tuple[Optional[str], Optional[str], Optional[str]]:
-    node_candidates = []
-    detected_node = shutil.which('node')
-    if detected_node:
-        node_candidates.append(detected_node)
-    node_candidates.extend(['/opt/homebrew/bin/node', '/usr/local/bin/node'])
-
-    node_bin = next((path for path in node_candidates if path and os.path.exists(path)), None)
-    if not node_bin:
-        return None, None, 'node runtime not found; install Node.js or add node to PATH'
-
-    roots: List[str] = []
-    existing_node_path = os.environ.get('NODE_PATH', '')
-    if existing_node_path:
-        roots.extend([p.strip() for p in existing_node_path.split(os.pathsep) if p.strip()])
-
-    openclaw_bin = shutil.which('openclaw')
-    if openclaw_bin:
-        package_root = os.path.dirname(os.path.realpath(openclaw_bin))
-        roots.append(os.path.join(package_root, 'node_modules'))
-
-    roots.extend([
-        '/opt/homebrew/lib/node_modules/openclaw/node_modules',
-        '/usr/local/lib/node_modules/openclaw/node_modules',
-    ])
-
-    checked = []
-    seen = set()
-    for root in roots:
-        if root in seen:
-            continue
-        seen.add(root)
-        checked.append(root)
-        if os.path.exists(os.path.join(root, '@larksuiteoapi', 'node-sdk')):
-            return node_bin, root, None
-
-    checked_text = ', '.join(checked) if checked else '(none)'
-    return node_bin, None, f'@larksuiteoapi/node-sdk not found; checked NODE_PATH candidates: {checked_text}'
-
-
-def _feishu_sync_blocker_message(text: str) -> Optional[str]:
-    normalized = (text or '').lower()
-    if not normalized:
-        return None
-    if 'node runtime not found' in normalized:
-        return 'node runtime not found; install Node.js or add node to PATH'
-    if '@larksuiteoapi/node-sdk not found' in text:
-        return text.strip()
-    if 'feishu_app_id / feishu_app_secret not configured' in normalized:
-        return 'FEISHU_APP_ID / FEISHU_APP_SECRET not configured'
-    if 'connect eperm 127.0.0.1:7897' in normalized:
-        return 'outbound Feishu API access is blocked by the current proxy/network sandbox (cannot connect to 127.0.0.1:7897)'
-    if 'getaddrinfo enotfound open.feishu.cn' in normalized or 'enotfound open.feishu.cn' in normalized:
-        return 'outbound DNS/network access to open.feishu.cn is unavailable in the current environment'
-    if any(token in normalized for token in ['econnrefused', 'etimedout', 'network error', 'socket hang up']) and 'feishu' in normalized:
-        return 'outbound network access to Feishu API is unavailable in the current environment'
-    return None
-
-
-def sync_report_to_feishu(md_filename: str = 'latest_phase1.md', title: Optional[str] = None) -> Optional[str]:
-    """将指定 markdown 报告同步到 Feishu Doc，并返回可验证的真实 docx URL。"""
-    if not FEISHU_DOC_SYNC_ENABLED:
-        print("Feishu doc sync disabled, skipping")
-        return None
-    app_id, app_secret = _resolve_feishu_credentials()
-    if _looks_like_placeholder(app_id) or _looks_like_placeholder(app_secret):
-        print("Feishu doc sync blocked: FEISHU_APP_ID / FEISHU_APP_SECRET not configured")
-        return None
-
-    md_path = os.path.join(DATA_DIR, md_filename)
-    if not os.path.exists(md_path):
-        print(f"{md_filename} not found, skipping Feishu doc sync")
-        return None
-
-    title = title or f"Solo Venture Screener-{datetime.now().strftime('%Y-%m-%d')}"
-    node_bin, node_path, runtime_error = _resolve_feishu_runtime()
-    if runtime_error:
-        print(f"Feishu doc sync blocked: {runtime_error}")
-        return None
-
-    node_script = r'''
-const fs = require('fs');
-const os = require('os');
-const path = require('path');
-const Lark = require('@larksuiteoapi/node-sdk');
-
-const appId = process.env.FEISHU_APP_ID || '';
-const appSecret = process.env.FEISHU_APP_SECRET || '';
-const indexToken = (process.env.FEISHU_INDEX_DOC_TOKEN || '').trim();
-const title = process.env.FEISHU_DOC_TITLE || '机会洞察';
-const mdPath = process.env.FEISHU_MD_PATH;
-
-const client = new Lark.Client({
-  appId,
-  appSecret,
-  appType: Lark.AppType.SelfBuild,
-  domain: Lark.Domain.Feishu,
-});
-
-function cleanBlocksForDescendant(blocks) {
-  return blocks.map((block) => {
-    const { parent_id, ...cleanBlock } = block;
-    if (cleanBlock.block_type === 32 && typeof cleanBlock.children === 'string') {
-      cleanBlock.children = [cleanBlock.children];
-    }
-    if (cleanBlock.block_type === 31 && cleanBlock.table) {
-      const prop = cleanBlock.table.property || {};
-      cleanBlock.table = { property: { row_size: prop.row_size, column_size: prop.column_size, ...(prop.column_width ? {column_width: prop.column_width} : {}) } };
-    }
-    return cleanBlock;
-  });
-}
-
-async function convertMarkdown(markdown) {
-  const res = await client.docx.document.convert({ data: { content_type: 'markdown', content: markdown } });
-  if (res.code !== 0) throw new Error('convert failed: ' + res.msg);
-  return { blocks: res.data?.blocks || [], firstLevelBlockIds: res.data?.first_level_block_ids || [] };
-}
-
-async function clearDocumentContent(docToken) {
-  const existing = await client.docx.documentBlock.list({ path: { document_id: docToken } });
-  if (existing.code !== 0) throw new Error(existing.msg);
-  const childIds = (existing.data?.items || []).filter(b => b.parent_id === docToken && b.block_type !== 1).map(b => b.block_id);
-  if (childIds.length > 0) {
-    const del = await client.docx.documentBlockChildren.batchDelete({ path: { document_id: docToken, block_id: docToken }, data: { start_index: 0, end_index: childIds.length } });
-    if (del.code !== 0) throw new Error(del.msg);
-  }
-}
-
-async function writeMarkdown(docToken, markdown) {
-  await clearDocumentContent(docToken);
-  const { blocks, firstLevelBlockIds } = await convertMarkdown(markdown);
-  if (!blocks.length) return;
-  const res = await client.docx.documentBlockDescendant.create({
-    path: { document_id: docToken, block_id: docToken },
-    data: { children_id: firstLevelBlockIds, descendants: cleanBlocksForDescendant(blocks), index: -1 }
-  });
-  if (res.code !== 0) throw new Error('descendant create failed: ' + res.msg + ' (code ' + res.code + ')');
-}
-
-async function listAllBlocks(docToken) {
-  const res = await client.docx.documentBlock.list({ path: { document_id: docToken } });
-  if (res.code !== 0) throw new Error(res.msg);
-  return res.data?.items || [];
-}
-
-function headingLevel(type) {
-  return ({3:1,4:2,5:3})[type] || null;
-}
-
-async function insertUnderDocList(docToken, lineMarkdown) {
-  const blocks = await listAllBlocks(docToken);
-  const heading = blocks.find(b => {
-    const elems = b.text?.elements || [];
-    const text = elems.map(e => e?.text_run?.content || '').join('');
-    return text.trim() === '文档列表';
-  });
-  if (!heading) throw new Error('未找到“文档列表”区块');
-  const parentId = heading.parent_id || docToken;
-  const childrenRes = await client.docx.documentBlockChildren.get({ path: { document_id: docToken, block_id: parentId } });
-  if (childrenRes.code !== 0) throw new Error(childrenRes.msg);
-  const siblings = childrenRes.data?.items || [];
-  const hIdx = siblings.findIndex(s => s.block_id === heading.block_id);
-  if (hIdx < 0) throw new Error('未找到“文档列表”区块在父节点中的位置');
-  const insertIndex = hIdx + 1;
-  const { blocks: newBlocks, firstLevelBlockIds } = await convertMarkdown(lineMarkdown);
-  const res = await client.docx.documentBlockDescendant.create({
-    path: { document_id: docToken, block_id: parentId },
-    data: { children_id: firstLevelBlockIds, descendants: cleanBlocksForDescendant(newBlocks), index: insertIndex }
-  });
-  if (res.code !== 0) throw new Error('index update failed: ' + res.msg + ' (code ' + res.code + ')');
-}
-
-(async () => {
-  const out = { created: false, write_ok: false, index_update_ok: false, doc_url: '', title, error: '', warning: '' };
-  try {
-    const markdown = fs.readFileSync(mdPath, 'utf8');
-    const created = await client.docx.document.create({ data: { title } });
-    if (created.code !== 0) throw new Error('create failed: ' + created.msg);
-    const docToken = created.data?.document?.document_id;
-    if (!docToken) throw new Error('create failed: missing document_id');
-    const docUrl = `https://feishu.cn/docx/${docToken}`;
-    if (!/^https:\/\/(?:[\w-]+\.)?feishu\.cn\/docx\/[A-Za-z0-9]+$/.test(docUrl)) {
-      throw new Error('returned doc URL is not a real Feishu docx URL');
-    }
-    out.created = true;
-    out.doc_url = docUrl;
-
-    await writeMarkdown(docToken, markdown);
-    out.write_ok = true;
-
-    if (indexToken) {
-      try {
-        const line = `- ${new Date().toISOString().slice(0,10)}: [${title}](${docUrl})`;
-        await insertUnderDocList(indexToken, line);
-        out.index_update_ok = true;
-      } catch (err) {
-        out.warning = err && err.message ? err.message : String(err);
-      }
-    }
-
-    console.log(JSON.stringify(out));
-  } catch (err) {
-    out.error = err && err.message ? err.message : String(err);
-    console.log(JSON.stringify(out));
-    process.exitCode = 1;
-  }
-})();
-'''
-
-    script_path = None
-    try:
-        with tempfile.NamedTemporaryFile('w', suffix='.js', delete=False, encoding='utf-8') as f:
-            f.write(node_script)
-            script_path = f.name
-
-        env = os.environ.copy()
-        env.update({
-            'FEISHU_APP_ID': app_id,
-            'FEISHU_APP_SECRET': app_secret,
-            'FEISHU_INDEX_DOC_TOKEN': FEISHU_INDEX_DOC_TOKEN,
-            'FEISHU_DOC_TITLE': title,
-            'FEISHU_MD_PATH': md_path,
-        })
-
-        env['NODE_PATH'] = f"{node_path}:{env.get('NODE_PATH', '')}" if env.get('NODE_PATH') else node_path
-        result = subprocess.run(
-            [node_bin, script_path],
-            capture_output=True,
-            text=True,
-            timeout=120,
-            env=env,
-        )
-        out = (result.stdout or '').strip() or (result.stderr or '').strip()
-        out = _sanitize_secret_text(out, [app_id or '', app_secret or ''])
-        url = _extract_real_feishu_doc_url(out)
-        if result.returncode == 0 and url:
-            print(f'Feishu daily doc: {url}')
-            return url
-        blocker = _feishu_sync_blocker_message(out)
-        if blocker:
-            print(f'Feishu doc sync blocked: {blocker}')
-            return None
-        raise RuntimeError(out or 'unknown feishu doc sync error')
-    except Exception as e:
-        err_text = _sanitize_secret_text(str(e), [app_id or '', app_secret or ''])
-        blocker = _feishu_sync_blocker_message(err_text)
-        if blocker:
-            print(f'Feishu doc sync blocked: {blocker}')
-        else:
-            print(f'Feishu doc sync failed: {err_text}')
-        return None
-    finally:
-        try:
-            os.unlink(script_path)
-        except Exception:
-            pass
-
-
-def sync_top10_report_to_feishu() -> Optional[str]:
-    """兼容旧调用。"""
-    return sync_report_to_feishu(md_filename='latest_top10.md', title=f"机会洞察-{datetime.now().strftime('%Y-%m-%d')}")
+    print(f"Saved to {json_file}")
+    cleanup_old_data(retention_days=14)
 
 
 def cleanup_old_data(retention_days: int = 14):
-    """清理历史机会快照，仅保留最近 N 天。"""
-    import re
     cutoff = datetime.now() - timedelta(days=retention_days)
     pattern = re.compile(r'^opportunities_(\d{8})_(\d{6})\.json$')
-
     removed = 0
     for name in os.listdir(DATA_DIR):
         m = pattern.match(name)
         if not m:
             continue
-        dt_str = m.group(1) + m.group(2)
         try:
-            dt = datetime.strptime(dt_str, '%Y%m%d%H%M%S')
+            dt = datetime.strptime(m.group(1) + m.group(2), '%Y%m%d%H%M%S')
         except Exception:
             continue
         if dt < cutoff:
@@ -2434,368 +320,49 @@ def cleanup_old_data(retention_days: int = 14):
                 removed += 1
             except Exception:
                 pass
-
     if removed:
         print(f'Cleanup: removed {removed} old snapshot files (> {retention_days} days)')
 
 
-def save_results(opportunities: List[Opportunity]):
-    """保存结果"""
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    
-    # 保存 JSON
-    json_file = os.path.join(DATA_DIR, f"opportunities_{timestamp}.json")
-    with open(json_file, 'w', encoding='utf-8') as f:
-        try:
-            json.dump([opp.to_dict() for opp in opportunities], f, ensure_ascii=False, indent=2)
-        except (TypeError, ValueError) as e:
-            print(f"JSON serialization error: {e}")
-            # 尝试简化数据
-            simple_data = []
-            for opp in opportunities:
-                try:
-                    simple_data.append({
-                        'id': opp.id,
-                        'title': opp.title,
-                        'score': opp.score
-                    })
-                except Exception:
-                    continue
-            json.dump(simple_data, f, ensure_ascii=False, indent=2)
-    
-    # 保存最新结果
-    latest_file = os.path.join(DATA_DIR, "latest.json")
-    try:
-        with open(latest_file, 'w', encoding='utf-8') as f:
-            json.dump([opp.to_dict() for opp in opportunities], f, ensure_ascii=False, indent=2)
-    except (IOError, OSError) as e:
-        print(f"Error saving latest.json: {e}")
-    
-    print(f"Saved to {json_file}")
-    cleanup_old_data(retention_days=14)
-
-
-def send_to_feishu(opportunities: List[Opportunity]):
-    """发送到飞书（通过 OpenClaw CLI）
-
-    修复点：某些环境下 openclaw 会输出 config warnings，
-    但消息实际已发送。这里用“返回码 + 输出特征”双判定，避免误报失败。
-    """
-    if not FEISHU_USER_ID:
-        print("FEISHU_USER_ID not configured, skipping Feishu notification")
-        return
-    if FEISHU_USER_ID.strip().lower() in {"ou_xxx", "user_xxx", "open_id_xxx", "placeholder"}:
-        print("FEISHU_USER_ID is placeholder, skipping direct Feishu notification")
-        return
-
-    def _looks_delivered(stdout: str, stderr: str) -> bool:
-        text = f"{stdout}\n{stderr}".lower()
-        # 兼容不同输出格式
-        success_signals = [
-            '"messageid"',
-            '"chatid"',
-            ' via ',
-            'result',
-            'sent',
-            'delivered',
-        ]
-        return any(sig in text for sig in success_signals)
-
-    try:
-        import subprocess
-
-        sent = 0
-        failed = 0
-
-        # 发送 Top 10
-        for opp in opportunities[:10]:
-            msg = opp.to_message()
-            cmd = [
-                "openclaw", "message", "send",
-                "--channel", "feishu",
-                "--target", f"user:{FEISHU_USER_ID}",
-                "--message", msg,
-                "--silent"
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-
-            delivered = (result.returncode == 0) or _looks_delivered(result.stdout, result.stderr)
-
-            if delivered:
-                sent += 1
-                if result.returncode != 0:
-                    print(f"✅ Sent to Feishu (with warnings): {opp.title[:50]}...")
-                else:
-                    print(f"✅ Sent to Feishu: {opp.title[:50]}...")
-            else:
-                failed += 1
-                err = (result.stderr or result.stdout or '').strip().replace('\n', ' ')
-                print(f"⚠️  Send failed: {err[:160]}")
-
-        print(f"✅ Feishu delivery summary: sent={sent}, failed={failed}, total={min(10, len(opportunities))}")
-
-    except Exception as e:
-        print(f"Error sending to Feishu: {e}")
-
-
-def create_github_issues(opportunities: List[Opportunity]):
-    """自动创建 GitHub Issue"""
-    if not GITHUB_TOKEN:
-        print("⚠️  GITHUB_TOKEN not configured, skipping GitHub issues")
-        print("   Configure: echo 'ghp_xxx' > ~/.github_token")
-        return
-    
-    import requests
-    
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/issues"
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.v3+json"
-    }
-    
-    created = 0
-    for opp in opportunities[:3]:  # 只创建 Top 3
-        try:
-            signal_label = _signal_strength_label(getattr(opp, 'phase2_adjusted_score', None) or opp.score)
-            validation_action = getattr(opp, 'phase2_decision_label', '') or opp.decision_label()
-            data = {
-                "title": f"🚀 {opp.title[:50]} - {validation_action}",
-                "body": f"""## 📊 机会评估
-
-- **机会信号**: {signal_label}
-- **验证动作**: {validation_action}
-- **来源**: {opp.source.upper()}
-- **发现日期**: {opp.created_at.strftime('%Y-%m-%d')}
-
-## 📖 项目介绍
-
-{opp.description if opp.description else opp.summary}
-
-## 👤 一人公司可行性
-
-{opp.solo_feasibility if opp.solo_feasibility else '待分析'}
-
-## 💰 商业模式
-
-- 启动成本：{opp.startup_cost or '待分析'}
-- 多久见钱：{opp.time_to_revenue or '待分析'}
-- 月收入潜力：{opp.monthly_potential or '待分析'}
-- 自动化率：{opp.automation_rate or '待分析'}
-
-## 🚀 第一步
-
-{opp.action_plan if opp.action_plan else '待分析'}
-
-## 📄 详情
-
-https://github.com/{GITHUB_REPO}/blob/main/opportunities/{opp.created_at.strftime('%Y-%m-%d')}_{opp.id}.md
-
----
-*Auto-created by Research Agent*""",
-                "labels": ["opportunity", "researching", "ai"]
-            }
-            
-            response = requests.post(url, headers=headers, json=data, timeout=30)
-            
-            if response.status_code == 201:
-                issue_url = response.json().get('html_url', '')
-                print(f"✅ Created Issue: {issue_url}")
-                created += 1
-            else:
-                print(f"⚠️  Failed: {response.status_code} - {response.text[:100]}")
-                
-        except Exception as e:
-            print(f"⚠️  Error: {e}")
-    
-    print(f"✅ Created {created}/3 GitHub issues")
-
-
-
+# ---------------------------------------------------------------------------
+# MVP generation
+# ---------------------------------------------------------------------------
 
 def generate_mvps(opportunities: List[Opportunity]):
-    """为 Top 机会生成 MVP"""
-    print("\n🚀 Generating MVPs...")
-    
+    print("\nGenerating MVPs...")
     generator = MVPGenerator()
     generated = 0
-    
-    for opp in opportunities[:2]:  # 只为 Top 2 生成 MVP
+    for opp in opportunities[:2]:
         try:
             opp_dict = {
-                'title': opp.title,
-                'summary': opp.summary,
+                'title': opp.title, 'summary': opp.summary,
                 'description': opp.description or opp.summary,
-                'score': opp.score,
-                'revenue_model': opp.revenue_model or 'Subscription',
+                'score': opp.score, 'revenue_model': opp.revenue_model or 'Subscription',
                 'startup_cost': opp.startup_cost or '$1-5k',
                 'time_to_revenue': opp.time_to_revenue or '30 days',
                 'monthly_potential': opp.monthly_potential or '$10-50k',
                 'automation_rate': opp.automation_rate or '90%+',
-                'agent_roles': opp.agent_roles or ['Development Agent']
+                'agent_roles': opp.agent_roles or ['Development Agent'],
             }
-            
             project_dir = generator.generate(opp_dict)
             if project_dir:
                 generated += 1
-                print(f"✅ Generated: {project_dir}")
+                print(f"Generated: {project_dir}")
         except Exception as e:
-            print(f"⚠️  Failed to generate MVP for {opp.title}: {e}")
-    
-    print(f"\n✅ Generated {generated}/{len(opportunities[:2])} MVPs")
+            print(f"Failed to generate MVP for {opp.title}: {e}")
+    print(f"\nGenerated {generated}/{len(opportunities[:2])} MVPs")
 
 
-def print_phase1_results(
-    kept: List[Opportunity],
-    watchlist: List[Opportunity],
-    dropped: List[Opportunity],
-    total_count: int,
-    assessments: Optional[dict] = None,
-    rule_adjustment: Optional[Dict[str, str]] = None,
-):
-    """打印 Phase 1 screener 摘要。"""
-    assessments = assessments or {}
-    rule_adjustment = rule_adjustment or _daily_rule_adjustment(kept + watchlist + dropped, assessments)
-    primary, remaining_watchlist = _primary_candidate(kept, watchlist)
-    print("\n" + "=" * 80)
-    print(f"Phase 1 Solo Venture Screener | 候选池 {total_count} 条")
-    print("=" * 80 + "\n")
-    print(f"今日最该调整的一条筛选规则：{rule_adjustment['suggestion']}")
-    print(f"依据：{rule_adjustment['evidence']}\n")
+# ---------------------------------------------------------------------------
+# Feedback CLI
+# ---------------------------------------------------------------------------
 
-    if primary:
-        assessment = assessments.get(primary.id)
-        print(f"今日唯一候选 | {_decision_label(primary.score, assessment.verdict if assessment else None)} | 信号 {_signal_strength_label(primary.score)}")
-        if assessment:
-            print(f"切口名称：{assessment.deliverable}")
-            print(f"目标用户：{assessment.target_user}")
-            print(f"高频场景：{_high_frequency_scenario(primary, assessment)}")
-            print(f"当前替代方案：{_current_alternative(primary, assessment)}")
-            print(f"为什么现有方案不好：{_why_existing_solution_bad(primary, assessment)}")
-            print(f"为什么现在值得做：{_why_now_worth_doing(primary, assessment)}")
-            print(f"为什么适合用户：{_why_fit_for_user(primary, assessment)}")
-            print(f"6 周最小收费版本：{_smallest_paid_mvp(primary, assessment)}")
-            print(f"首批 20 用户从哪里来：{_first_20_users_source(primary, assessment)}")
-            print(f"不该做大的边界：{_do_not_scale_boundary(primary, assessment)}")
-            print(f"最终结论：{_final_conclusion(primary, assessment)}")
-        print(f"链接：{primary.url}")
-    else:
-        print("今日唯一候选 | 丢弃")
-        for opp in dropped[:2]:
-            assessment = assessments.get(opp.id)
-            print(f"- {opp.title}：{_filtered_reason(opp, assessment)}")
-
-    if remaining_watchlist:
-        print("\n继续观察：")
-        for idx, opp in enumerate(remaining_watchlist, 1):
-            assessment = assessments.get(opp.id)
-            verdict = assessment.verdict if assessment else None
-            summary = _phase2_signal_summary(opp, assessment) if assessment else '证据待补充'
-            print(f"{idx}. {_decision_label(opp.score, verdict)} | 信号 {_signal_strength_label(opp.score)} | {opp.title}")
-            print(f"   {summary}")
-            print(f"   {_final_conclusion(opp, assessment)}")
-
-    print("\n今天不值得做：")
-    not_worth_lines = _not_worth_doing_lines(dropped, assessments)
-    if not_worth_lines:
-        for line in not_worth_lines:
-            print(line)
-    else:
-        print("无更多可列出的过滤样本")
-    print()
-
-
-def print_results(opportunities: List[Opportunity]):
-    """打印结果"""
-    print("\n" + "="*80)
-    print(f"发现 {len(opportunities)} 个产品机会")
-    print("="*80 + "\n")
-    
-    for i, opp in enumerate(opportunities[:5], 1):  # 只显示 top 5
-        print(f"#{i} [{opp.source.upper()}] {opp.decision_label()} | 信号：{_signal_strength_label(opp.display_score())}")
-        print(f"   标题：{opp.title}")
-        print(f"   链接：{opp.url}")
-        print()
-        print(f"   📖 项目介绍")
-        print(f"   {opp.description[:200] if opp.description else opp.summary[:200]}...")
-        print()
-        print(f"   👤 一人公司可行性")
-        print(f"   {opp.solo_feasibility[:150] if opp.solo_feasibility else '待分析'}...")
-        print()
-        print(f"   🤖 Agent 角色：{', '.join(opp.agent_roles) if opp.agent_roles else '待分析'}")
-        print(f"   💰 启动成本：{opp.startup_cost or '待分析'}")
-        print(f"   ⏱️ 多久见钱：{opp.time_to_revenue or '待分析'}")
-        print(f"   📈 收入模式：{opp.revenue_model or '待分析'}")
-        print(f"   🎯 月收入潜力：{opp.monthly_potential or '待分析'}")
-        print(f"   ⚙️ 自动化率：{opp.automation_rate or '待分析'}")
-        print(f"   📢 获客渠道：{opp.customer_acquisition or '待分析'}")
-        print()
-        print(f"   ⚠️ 风险")
-        print(f"   {opp.risks[:150] if opp.risks else '待分析'}...")
-        print()
-        print(f"   🚀 第一步")
-        print(f"   {opp.action_plan[:100] if opp.action_plan else '待分析'}...")
-        print()
-        print(f"   🔗 相关链接")
-        print(f"   - 原始链接：{opp.source_url}")
-        for link in opp.research_links[1:3]:  # 显示研究链接
-            print(f"   - {link}")
-        print()
-        print("-"*80 + "\n")
-
-
-FEEDBACK_FILE = os.path.join(DATA_DIR, 'feedback.json')
-
-
-def _load_feedback() -> Dict[str, Any]:
-    if not os.path.exists(FEEDBACK_FILE):
-        return {}
-    try:
-        with open(FEEDBACK_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def _save_feedback(data: Dict[str, Any]) -> None:
-    with open(FEEDBACK_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-def _apply_feedback_boosts(opportunities: List[Opportunity]) -> None:
-    """Apply score adjustments based on historical feedback on similar pain themes."""
-    feedback = _load_feedback()
-    if not feedback:
-        return
-
-    validated_themes: set[str] = set()
-    failed_themes: set[str] = set()
-    for fp, entry in feedback.items():
-        tags = entry.get('tags', [])
-        outcome = entry.get('outcome', '')
-        for tag in tags:
-            tag_lower = tag.lower()
-            if outcome == 'validated':
-                validated_themes.add(tag_lower)
-            elif outcome == 'failed':
-                failed_themes.add(tag_lower)
-
-    for opp in opportunities:
-        opp_tags = {t.lower() for t in (opp.tags or [])}
-        if opp_tags & validated_themes:
-            opp.feedback_boost = 10
-        elif opp_tags & failed_themes:
-            opp.feedback_boost = -5
-        else:
-            opp.feedback_boost = 0
-
-
-def run_feedback_cli() -> None:
-    """Interactive CLI for recording feedback on recent kept/watch opportunities."""
+def run_feedback_cli():
+    """Interactive CLI for recording feedback on recent opportunities."""
     latest_file = os.path.join(DATA_DIR, 'latest.json')
     if not os.path.exists(latest_file):
-        print("No latest.json found. Run the agent first to generate opportunities.")
+        print("No latest.json found. Run the agent first.")
         return
-
     try:
         with open(latest_file, 'r', encoding='utf-8') as f:
             raw = json.load(f)
@@ -2803,68 +370,55 @@ def run_feedback_cli() -> None:
         print(f"Error reading latest.json: {e}")
         return
 
-    candidates = []
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        verdict = item.get('phase2_verdict', '')
-        if verdict in ('keep', 'watch'):
-            candidates.append(item)
-
+    candidates = [item for item in raw if isinstance(item, dict) and item.get('phase2_verdict') in ('keep', 'watch')]
     if not candidates:
         print("No kept/watch opportunities found in latest run.")
         return
 
     feedback = _load_feedback()
-    print(f"\n{'='*60}")
-    print(f"Feedback for {len(candidates)} recent opportunities")
-    print(f"{'='*60}\n")
+    print(f"\n{'='*60}\nFeedback for {len(candidates)} recent opportunities\n{'='*60}\n")
 
     for idx, item in enumerate(candidates, 1):
         title = item.get('title', 'Unknown')[:60]
         verdict = item.get('phase2_verdict', '?')
-        fp = _fingerprint_opportunity(_restore_opportunity_from_dict(item))
+        opp = _restore_opportunity_from_dict(item)
+        fp = _fingerprint_opportunity(opp)
 
-        existing = feedback.get(fp)
-        if existing:
-            print(f"  #{idx} {title} [{verdict}] -- already has feedback: {existing.get('action', '?')} / {existing.get('outcome', '?')}")
+        if fp in feedback:
+            print(f"  #{idx} {title} [{verdict}] -- already has feedback")
             continue
 
         print(f"\n  #{idx} {title} [{verdict}]")
-        print(f"      {item.get('description', '')[:120]}")
-        print()
+        print(f"      {item.get('description', '')[:120]}\n")
         print("  Action? (p)ursued / (s)kipped / (i)rrelevant / Enter to skip:")
         action_input = input("  > ").strip().lower()
         if not action_input:
             continue
-
-        action_map = {'p': 'pursued', 's': 'skipped', 'i': 'irrelevant'}
-        action = action_map.get(action_input[0], '')
+        action = {'p': 'pursued', 's': 'skipped', 'i': 'irrelevant'}.get(action_input[0], '')
         if not action:
             continue
 
         outcome = ''
         if action == 'pursued':
             print("  Outcome? (v)alidated / (f)ailed / (o)ngoing / Enter to skip:")
-            outcome_input = input("  > ").strip().lower()
-            outcome_map = {'v': 'validated', 'f': 'failed', 'o': 'ongoing'}
-            outcome = outcome_map.get(outcome_input[0] if outcome_input else '', '')
+            oi = input("  > ").strip().lower()
+            outcome = {'v': 'validated', 'f': 'failed', 'o': 'ongoing'}.get(oi[0] if oi else '', '')
 
-        print("  Notes (optional, Enter to skip):")
+        print("  Notes (optional):")
         notes = input("  > ").strip()
 
         feedback[fp] = {
-            'title': item.get('title', ''),
-            'action': action,
-            'outcome': outcome,
-            'notes': notes,
-            'tags': item.get('tags', []),
-            'rated_at': datetime.now().isoformat(),
+            'title': item.get('title', ''), 'action': action, 'outcome': outcome,
+            'notes': notes, 'tags': item.get('tags', []), 'rated_at': datetime.now().isoformat(),
         }
 
     _save_feedback(feedback)
-    print(f"\nFeedback saved to {FEEDBACK_FILE} ({len(feedback)} entries total)")
+    print(f"\nFeedback saved ({len(feedback)} entries total)")
 
+
+# ---------------------------------------------------------------------------
+# Finalize empty run
+# ---------------------------------------------------------------------------
 
 def _finalize_top0_run(reason: str):
     rule_adjustment = _daily_rule_adjustment([], {})
@@ -2878,48 +432,53 @@ def _finalize_top0_run(reason: str):
     print("MVP generation disabled in Phase 1; use --enable-mvp-generation to override")
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="调研 Agent - 发现产品机会")
     parser.add_argument('--test', action='store_true', help='测试模式')
     parser.add_argument('--debug', action='store_true', help='调试模式')
+    parser.add_argument('--feedback', action='store_true', help='录入对近期机会的反馈')
     parser.add_argument('--weekly-report', action='store_true', help='基于历史快照生成深筛周报')
     parser.add_argument('--weekly-days', type=int, default=7, help='深筛周报回看天数（默认 7）')
-    parser.add_argument('--feedback', action='store_true', help='录入对近期机会的反馈（pursued/skipped/validated/failed）')
-    parser.add_argument('--hn-limit', type=int, default=30, help='HN 获取数量')
-    parser.add_argument('--ph-limit', type=int, default=20, help='PH 获取数量')
-    parser.add_argument('--min-score', type=int, default=60, help='最低分数')
-    parser.add_argument('--media-hours', type=int, default=48, help='中文媒体抓取时间窗口（小时）')
-    parser.add_argument('--indie-limit', type=int, default=15, help='IndieHackers 获取数量')
-    parser.add_argument('--reddit-limit', type=int, default=10, help='Reddit 获取数量')
-    parser.add_argument('--github-limit', type=int, default=10, help='GitHub Trending 获取数量')
-    parser.add_argument('--enable-agent-reach', action='store_true', help='启用 Agent Reach 桥接采集（X/YouTube/Reddit）')
-    parser.add_argument('--ar-limit', type=int, default=10, help='Agent Reach 每平台抓取数量')
+    parser.add_argument('--hn-limit', type=int, default=30)
+    parser.add_argument('--ph-limit', type=int, default=20)
+    parser.add_argument('--min-score', type=int, default=60)
+    parser.add_argument('--media-hours', type=int, default=48)
+    parser.add_argument('--indie-limit', type=int, default=15)
+    parser.add_argument('--reddit-limit', type=int, default=10)
+    parser.add_argument('--github-limit', type=int, default=10)
+    parser.add_argument('--enable-agent-reach', action='store_true')
+    parser.add_argument('--ar-limit', type=int, default=10)
     parser.add_argument('--disable-app-store-reviews', action='store_true', help='禁用 App Store 差评采集（默认开启）')
-    parser.add_argument('--app-store-review-limit', type=int, default=15, help='App Store 差评采集数量（默认 15）')
+    parser.add_argument('--app-store-review-limit', type=int, default=15)
     parser.add_argument('--disable-github-pain-issues', action='store_true', help='禁用 GitHub issue 痛点采集（默认开启）')
-    parser.add_argument('--github-pain-limit', type=int, default=15, help='GitHub issue 痛点采集数量（默认 15）')
-    parser.add_argument('--reddit-pain-limit', type=int, default=15, help='Reddit 痛点搜索采集数量（默认 15）')
+    parser.add_argument('--github-pain-limit', type=int, default=15)
+    parser.add_argument('--reddit-pain-limit', type=int, default=15)
     parser.add_argument('--disable-saas-reviews', action='store_true', help='禁用 SaaS 评论差评采集（默认开启）')
-    parser.add_argument('--saas-review-limit', type=int, default=12, help='SaaS 评论差评采集数量（默认 12）')
-    parser.add_argument('--indie-mode', action='store_true', help='一人公司模式：专注 Indie Hacker/微 SaaS/自动化机会')
-    parser.add_argument('--enable-github-issues', action='store_true', help='显式启用 GitHub issue 创建（默认关闭）')
-    parser.add_argument('--enable-mvp-generation', action='store_true', help='显式启用 MVP 自动生成（默认关闭）')
+    parser.add_argument('--saas-review-limit', type=int, default=12)
+    parser.add_argument('--indie-mode', action='store_true')
+    parser.add_argument('--enable-github-issues', action='store_true')
+    parser.add_argument('--enable-mvp-generation', action='store_true')
     return parser
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main():
-    """主函数"""
     parser = build_arg_parser()
     args = parser.parse_args()
-    
-    # 设置调试模式
+
     if args.debug:
         os.environ['DEBUG'] = 'true'
-    
+
     global DEBUG
     DEBUG = args.debug or DEBUG
-    
-    # 设置日志
+
     logger = setup_logging()
     logger.info("Starting research agent...")
 
@@ -2933,34 +492,24 @@ def main():
             print(f"Weekly report ready: {report_file}")
         return
 
-    # 验证配置
     try:
         validate_config()
     except ValueError as e:
-        print(f"❌ 配置错误：{e}")
-        print("请检查 .env 文件配置")
+        print(f"配置错误：{e}")
         sys.exit(1)
-    
-    # 检查 API Key
+
     if not BAILIAN_API_KEY:
-        logger.error("BAILIAN_API_KEY not configured. Please set it in .env file.")
+        logger.error("BAILIAN_API_KEY not configured.")
         print("错误：请配置 BAILIAN_API_KEY")
-        print("1. 复制 .env.example 为 .env")
-        print("2. 填写你的阿里百炼 API Key")
         sys.exit(1)
-    
-    # 测试模式
+
     if args.test:
         logger.info("Test mode: fetching sample data...")
         items = collect_data(
-            hn_limit=5,
-            ph_limit=3,
-            media_hours=args.media_hours,
-            indie_limit=min(5, args.indie_limit),
-            reddit_limit=min(4, args.reddit_limit),
+            hn_limit=5, ph_limit=3, media_hours=args.media_hours,
+            indie_limit=min(5, args.indie_limit), reddit_limit=min(4, args.reddit_limit),
             github_limit=min(4, args.github_limit),
-            enable_agent_reach=args.enable_agent_reach,
-            ar_limit=min(5, args.ar_limit),
+            enable_agent_reach=args.enable_agent_reach, ar_limit=min(5, args.ar_limit),
             enable_app_store_reviews=not args.disable_app_store_reviews,
             app_store_review_limit=min(4, args.app_store_review_limit),
             enable_github_pain_issues=not args.disable_github_pain_issues,
@@ -2973,17 +522,12 @@ def main():
         for item in items[:3]:
             print(f"  - {item['title']}")
         return
-    
-    # 正常运行
+
+    # --- Normal run ---
     items = collect_data(
-        hn_limit=args.hn_limit,
-        ph_limit=args.ph_limit,
-        media_hours=args.media_hours,
-        indie_limit=args.indie_limit,
-        reddit_limit=args.reddit_limit,
-        github_limit=args.github_limit,
-        enable_agent_reach=args.enable_agent_reach,
-        ar_limit=args.ar_limit,
+        hn_limit=args.hn_limit, ph_limit=args.ph_limit, media_hours=args.media_hours,
+        indie_limit=args.indie_limit, reddit_limit=args.reddit_limit, github_limit=args.github_limit,
+        enable_agent_reach=args.enable_agent_reach, ar_limit=args.ar_limit,
         enable_app_store_reviews=not args.disable_app_store_reviews,
         app_store_review_limit=args.app_store_review_limit,
         enable_github_pain_issues=not args.disable_github_pain_issues,
@@ -2995,7 +539,6 @@ def main():
     opportunities = asyncio.run(analyze_items_async(items, min_score=args.min_score))
 
     if opportunities:
-        # 机会去重：当日去重 + 跨天去重 + 一人公司重排
         opportunities = deduplicate_opportunities(opportunities)
         opportunities = deduplicate_across_days(opportunities, days=14)
 
@@ -3008,39 +551,33 @@ def main():
         _apply_feedback_boosts(opportunities)
         assessments = _annotate_phase2_assessments(opportunities)
         opportunities = rerank_for_solo(opportunities, assessments)
-        kept_candidates, watch_candidates, dropped_candidates = _bucket_phase2_candidates(opportunities, assessments)
-        rule_adjustment = _daily_rule_adjustment(opportunities, assessments)
+        kept, watch, dropped = _bucket_phase2_candidates(opportunities, assessments)
+        rule_adj = _daily_rule_adjustment(opportunities, assessments)
 
         save_results(opportunities)
         save_phase1_report(opportunities, assessments)
         feishu_doc_url = sync_report_to_feishu()
-        print_phase1_results(
-            kept_candidates,
-            watch_candidates,
-            dropped_candidates,
-            len(opportunities),
-            assessments,
-            rule_adjustment=rule_adjustment,
-        )
+        print_phase1_results(kept, watch, dropped, len(opportunities), assessments, rule_adjustment=rule_adj)
+
         if feishu_doc_url:
             print(f"Verified Feishu doc URL: {feishu_doc_url}")
-        if kept_candidates:
-            send_to_feishu(kept_candidates)
+        if kept:
+            send_to_feishu(kept)
         else:
             print("No kept candidate to send via direct Feishu message")
 
         if args.enable_github_issues:
-            create_github_issues(kept_candidates)
+            create_github_issues(kept)
         else:
-            print("GitHub issue creation disabled in Phase 1; use --enable-github-issues to override")
+            print("GitHub issue creation disabled; use --enable-github-issues to override")
 
         if args.enable_mvp_generation:
-            generate_mvps(kept_candidates)
+            generate_mvps(kept)
         else:
-            print("MVP generation disabled in Phase 1; use --enable-mvp-generation to override")
+            print("MVP generation disabled; use --enable-mvp-generation to override")
     else:
         print("未发现符合条件的机会")
-        _finalize_top0_run("本次采集或分析未产出可排序候选；已输出 Top0 报告供后续排查。")
+        _finalize_top0_run("本次采集或分析未产出可排序候选。")
 
 
 if __name__ == "__main__":

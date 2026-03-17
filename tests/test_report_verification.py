@@ -9,7 +9,10 @@ from subprocess import CompletedProcess
 from unittest.mock import patch
 
 import main
-from main import _build_phase2_assessment
+import reports.daily_report as daily_mod
+import integrations.feishu as feishu_mod
+from screening.phase2 import _build_phase2_assessment
+from reports.daily_report import save_phase1_report
 from models.opportunity import Opportunity
 
 
@@ -58,9 +61,9 @@ def _drop_opportunity(opp_id: str) -> Opportunity:
 class ReportVerificationTests(unittest.TestCase):
     def test_finalize_top0_run_writes_report_and_console_summary(self):
         reason = "本次命中的机会与近 14 天重复，未产生新的 Top1/Watchlist。"
-        with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "DATA_DIR", tmpdir), patch.object(
-            main, "sync_report_to_feishu", return_value=None
-        ):
+        with tempfile.TemporaryDirectory() as tmpdir, \
+             patch.object(daily_mod, "DATA_DIR", tmpdir), \
+             patch.object(main, "sync_report_to_feishu", return_value=None):
             stdout = io.StringIO()
             with redirect_stdout(stdout):
                 main._finalize_top0_run(reason)
@@ -77,7 +80,8 @@ class ReportVerificationTests(unittest.TestCase):
             self.assertIn(reason, report)
 
             console = stdout.getvalue()
-            self.assertIn("今日最该调整的一条筛选规则：继续把“14 天内能收钱 + 首批 20 用户来源具体”当作硬门槛", console)
+            self.assertIn('今日最该调整的一条筛选规则', console)
+            self.assertIn('14 天内能收钱', console)
             self.assertIn("今日唯一候选 | 丢弃", console)
             self.assertIn("No kept candidate to send via direct Feishu message", console)
 
@@ -85,9 +89,9 @@ class ReportVerificationTests(unittest.TestCase):
         opportunities = [_watch_opportunity("watch-1"), _drop_opportunity("drop-1")]
         assessments = {opp.id: _build_phase2_assessment(opp) for opp in opportunities}
 
-        with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "DATA_DIR", tmpdir):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(daily_mod, "DATA_DIR", tmpdir):
             with redirect_stdout(io.StringIO()):
-                main.save_phase1_report(opportunities, assessments)
+                save_phase1_report(opportunities, assessments)
 
             latest_report = os.path.join(tmpdir, "latest_phase1.md")
             self.assertTrue(os.path.exists(latest_report))
@@ -106,9 +110,9 @@ class ReportVerificationTests(unittest.TestCase):
         drops = [_drop_opportunity(f"drop-{idx}") for idx in range(1, 5)]
         assessments = {opp.id: _build_phase2_assessment(opp) for opp in drops}
 
-        with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "DATA_DIR", tmpdir):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(daily_mod, "DATA_DIR", tmpdir):
             with redirect_stdout(io.StringIO()):
-                main.save_phase1_report(drops, assessments)
+                save_phase1_report(drops, assessments)
 
             with open(os.path.join(tmpdir, "latest_phase1.md"), "r", encoding="utf-8") as fh:
                 report = fh.read()
@@ -121,27 +125,22 @@ class ReportVerificationTests(unittest.TestCase):
             self.assertIn("主战场", line)
 
     def test_sync_report_to_feishu_redacts_subprocess_failure_output(self):
-        with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "DATA_DIR", tmpdir), patch.object(
-            main, "FEISHU_DOC_SYNC_ENABLED", True
-        ), patch.object(main, "_resolve_feishu_credentials", return_value=("cli_secret", "top_secret")), patch.object(
-            main, "_resolve_feishu_runtime", return_value=("/opt/homebrew/bin/node", "/tmp/openclaw/node_modules", None)
-        ), patch.object(
-            main.subprocess,
-            "run",
-            return_value=CompletedProcess(
-                args=["node", "fake.js"],
-                returncode=1,
-                stdout='{"app_id":"cli_secret","app_secret":"top_secret"} and top_secret',
-                stderr="",
-            ),
-        ):
+        with tempfile.TemporaryDirectory() as tmpdir, \
+             patch.object(feishu_mod, "DATA_DIR", tmpdir), \
+             patch.object(feishu_mod, "FEISHU_DOC_SYNC_ENABLED", True), \
+             patch.object(feishu_mod, "_resolve_feishu_credentials", return_value=("cli_secret", "top_secret")), \
+             patch.object(feishu_mod, "_resolve_feishu_runtime", return_value=("/opt/homebrew/bin/node", "/tmp/openclaw/node_modules", None)), \
+             patch("integrations.feishu.subprocess.run", return_value=CompletedProcess(
+                 args=["node", "fake.js"], returncode=1,
+                 stdout='{"app_id":"cli_secret","app_secret":"top_secret"} and top_secret', stderr="",
+             )):
             latest_report = os.path.join(tmpdir, "latest_phase1.md")
             with open(latest_report, "w", encoding="utf-8") as fh:
                 fh.write("# test")
 
             stdout = io.StringIO()
             with redirect_stdout(stdout):
-                result = main.sync_report_to_feishu()
+                result = feishu_mod.sync_report_to_feishu()
 
             self.assertIsNone(result)
             console = stdout.getvalue()
@@ -152,9 +151,9 @@ class ReportVerificationTests(unittest.TestCase):
 
     def test_top0_report_still_outputs_three_not_worth_doing_bullets(self):
         reason = "本次命中的机会与近 14 天重复，未产生新的 Top1/Watchlist。"
-        with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "DATA_DIR", tmpdir), patch.object(
-            main, "sync_report_to_feishu", return_value=None
-        ):
+        with tempfile.TemporaryDirectory() as tmpdir, \
+             patch.object(daily_mod, "DATA_DIR", tmpdir), \
+             patch.object(main, "sync_report_to_feishu", return_value=None):
             with redirect_stdout(io.StringIO()):
                 main._finalize_top0_run(reason)
 

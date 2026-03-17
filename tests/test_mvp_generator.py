@@ -8,31 +8,42 @@ from mvp_generator import MVPGenerator
 
 
 class MVPGeneratorTests(unittest.TestCase):
-    def test_generated_readme_uses_signal_and_validation_action_labels(self):
+    def test_generates_landing_page_and_readme(self):
         generator = MVPGenerator(output_dir=tempfile.mkdtemp())
         try:
-            project_dir = tempfile.mkdtemp(dir=generator.output_dir)
             opportunity = {
                 'title': 'Refund abuse audit for Shopify merchants',
-                'description': '帮助 Shopify 商家每周识别退款滥用和高风险订单。',
-                'summary': '先卖退款滥用审计报告。',
-                'signal_label': '高',
-                'decision_label': '做 7 天 MVP 验证',
+                'description': 'Help Shopify merchants identify refund abuse weekly.',
+                'summary': 'Weekly refund abuse audit reports.',
+                'revenue_model': 'One-time + monthly',
+                'startup_cost': '$1-5k',
+                'phase2_target_user': 'Shopify merchants with $5-50k monthly GMV',
+                'phase2_deliverable': 'Weekly refund abuse audit report',
+                'phase2_why_existing_bad': 'Shopify native tools only flag after the fact.',
+                'action_plan': 'Manually audit 20 merchants, deliver report.',
             }
 
-            generator._generate_readme(project_dir, opportunity)
+            project_dir = generator.generate(opportunity)
+
+            self.assertTrue(os.path.exists(os.path.join(project_dir, 'index.html')))
+            self.assertTrue(os.path.exists(os.path.join(project_dir, 'README.md')))
+
+            with open(os.path.join(project_dir, 'index.html'), 'r', encoding='utf-8') as fh:
+                html = fh.read()
+            self.assertIn('Refund abuse audit for Shopify merchants', html)
+            self.assertIn('tailwindcss', html)
+            self.assertIn('formspree', html.lower())
+            self.assertIn('Join Waitlist', html)
+            self.assertNotIn('pytest', html)
+            self.assertNotIn('/100', html)
 
             with open(os.path.join(project_dir, 'README.md'), 'r', encoding='utf-8') as fh:
                 readme = fh.read()
-
-            self.assertIn('**机会信号**: 高', readme)
-            self.assertIn('**验证动作**: 做 7 天 MVP 验证', readme)
-            self.assertIn('python3 -m unittest discover -s tests -q', readme)
-            self.assertNotIn('pytest', readme)
+            self.assertIn('Landing Page Generator', readme)
+            self.assertIn('Validation Plan', readme)
+            self.assertIn('Revenue model', readme)
             self.assertNotIn('**Score**', readme)
-            self.assertNotIn('/100', readme)
         finally:
-            # tempfile dirs are fine to leave to OS cleanup in tests; base_dir removed best-effort
             pass
 
 

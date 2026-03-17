@@ -9,7 +9,8 @@ from contextlib import redirect_stdout
 from datetime import datetime
 from unittest.mock import patch
 
-import main
+import reports.weekly_report as weekly_mod
+from reports.weekly_report import save_weekly_report
 from models.opportunity import Opportunity
 
 
@@ -63,7 +64,7 @@ class WeeklyReportTests(unittest.TestCase):
 
     def test_weekly_report_summarizes_repeated_patterns_and_unique_direction(self):
         now = datetime(2026, 3, 17, 10, 0, 0)
-        with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "DATA_DIR", tmpdir):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(weekly_mod, "DATA_DIR", tmpdir):
             self._write_snapshot(
                 tmpdir,
                 "20260312_080000",
@@ -82,7 +83,7 @@ class WeeklyReportTests(unittest.TestCase):
 
             stdout = io.StringIO()
             with redirect_stdout(stdout):
-                main.save_weekly_report(window_days=7, now=now)
+                save_weekly_report(window_days=7, now=now)
 
             latest_report = os.path.join(tmpdir, "latest_weekly.md")
             self.assertTrue(os.path.exists(latest_report))
@@ -102,9 +103,9 @@ class WeeklyReportTests(unittest.TestCase):
 
     def test_weekly_report_handles_empty_history(self):
         now = datetime(2026, 3, 17, 10, 0, 0)
-        with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "DATA_DIR", tmpdir):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(weekly_mod, "DATA_DIR", tmpdir):
             with redirect_stdout(io.StringIO()):
-                main.save_weekly_report(window_days=7, now=now)
+                save_weekly_report(window_days=7, now=now)
 
             with open(os.path.join(tmpdir, "latest_weekly.md"), "r", encoding="utf-8") as fh:
                 report = fh.read()
@@ -114,11 +115,11 @@ class WeeklyReportTests(unittest.TestCase):
 
     def test_weekly_report_does_not_force_direction_when_all_history_is_drop(self):
         now = datetime(2026, 3, 17, 10, 0, 0)
-        with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "DATA_DIR", tmpdir):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(weekly_mod, "DATA_DIR", tmpdir):
             self._write_snapshot(tmpdir, "20260316_080000", [_drop_opportunity("drop-1"), _drop_opportunity("drop-2")])
 
             with redirect_stdout(io.StringIO()):
-                main.save_weekly_report(window_days=7, now=now)
+                save_weekly_report(window_days=7, now=now)
 
             with open(os.path.join(tmpdir, "latest_weekly.md"), "r", encoding="utf-8") as fh:
                 report = fh.read()
