@@ -16,9 +16,10 @@ import sys
 import json
 import asyncio
 import argparse
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 import hashlib
 import subprocess
 import tempfile
@@ -1184,6 +1185,124 @@ def _not_worth_doing_lines(dropped: List[Opportunity], assessments: dict) -> Lis
     return lines[:5]
 
 
+def _daily_rule_adjustment(opportunities: List[Opportunity], assessments: Optional[dict] = None) -> Dict[str, str]:
+    assessments = assessments or {opp.id: _build_phase2_assessment(opp) for opp in opportunities}
+
+    if not opportunities:
+        return {
+            'suggestion': '继续把“14 天内能收钱 + 首批 20 用户来源具体”当作硬门槛，不因为样本少就放松。',
+            'evidence': '今天没有新的候选样本，当前最稳的做法仍然是先守住付费窗口和首客名单这两条线。',
+        }
+
+    candidates: List[Dict[str, Any]] = []
+
+    def _pick_rule(key: str, hits: List[Opportunity], suggestion: str, evidence_builder) -> None:
+        if not hits:
+            return
+        candidates.append({
+            'key': key,
+            'hits': len(hits),
+            'suggestion': suggestion,
+            'evidence': evidence_builder(hits),
+        })
+
+    generic_acquisition_hits = [
+        opp for opp in opportunities
+        if _acquisition_specificity_level(opp.customer_acquisition) == 0
+    ]
+    _pick_rule(
+        'generic_acquisition',
+        generic_acquisition_hits,
+        '把“首批 20 用户来源仍是 SEO / 社媒 / 泛 cold outreach”的机会直接降为丢弃，不再给继续观察名额。',
+        lambda hits: f'今天有 {len(hits)} 条样本的首客来源仍停留在泛渠道词，最典型的是「{hits[0].title}」。',
+    )
+
+    generic_plan_hits = [
+        opp for opp in opportunities
+        if _is_generic_action_plan(opp.action_plan)
+    ]
+    _pick_rule(
+        'generic_plan',
+        generic_plan_hits,
+        '把“第一步还是先做 MVP 再迭代”的机会再降一档，除非同时给出可收费交付和具体客户名单。',
+        lambda hits: f'今天有 {len(hits)} 条样本在首单动作上仍是模板话，继续保留只会稀释验证精力。',
+    )
+
+    crowded_frontline_hits = [
+        opp for opp in opportunities
+        if (assessments.get(opp.id) or _build_phase2_assessment(opp)).crowded_hits
+        and (assessments.get(opp.id) or _build_phase2_assessment(opp)).frontline_hits
+    ]
+    _pick_rule(
+        'crowded_frontline',
+        crowded_frontline_hits,
+        '把“落在大厂或成熟产品主战场”的机会直接过滤，不再给 watch 名额。',
+        lambda hits: f'今天有 {len(hits)} 条样本同时踩中红海类目和平台原生能力，最典型的是「{hits[0].title}」。',
+    )
+
+    weak_story_source_hits = [
+        opp for opp in opportunities
+        if (
+            (assessments.get(opp.id) or _build_phase2_assessment(opp)).verdict == 'drop'
+            and (opp.source or '').lower() in {'hn', 'ph', 'indiehackers', '36kr', 'huxiu', 'tiehan'}
+            and not _is_fast_payback_window(opp.time_to_revenue)
+        )
+    ]
+    _pick_rule(
+        'weak_story_source',
+        weak_story_source_hits,
+        '把“成功案例 / 媒体报道 / Show HN”默认当背景噪音，除非同时给出 14 天收钱窗口和具体外联名单。',
+        lambda hits: f'今天有 {len(hits)} 条样本来源更像故事或报道，而不是用户催着付钱的前线信号。',
+    )
+
+    heavy_delivery_hits = [
+        opp for opp in opportunities
+        if (assessments.get(opp.id) or _build_phase2_assessment(opp)).heavy_delivery_hits
+    ]
+    _pick_rule(
+        'heavy_delivery',
+        heavy_delivery_hits,
+        '把“需要长期实施 / 集成 / 定制交付”的机会直接判掉，别让服务化题目挤占验证名额。',
+        lambda hits: f'今天有 {len(hits)} 条样本一开始就要求重交付，单人模型很难复制扩张。',
+    )
+
+    if candidates:
+        priority = {
+            'generic_acquisition': 5,
+            'crowded_frontline': 4,
+            'generic_plan': 3,
+            'weak_story_source': 2,
+            'heavy_delivery': 1,
+        }
+        best = max(candidates, key=lambda item: (item['hits'], priority.get(item['key'], 0)))
+        return {
+            'suggestion': best['suggestion'],
+            'evidence': best['evidence'],
+        }
+
+    keep_exceptions = [
+        opp for opp in opportunities
+        if (
+            (assessments.get(opp.id) or _build_phase2_assessment(opp)).verdict in {'keep', 'watch'}
+            and (opp.source or '').lower() in {'hn', 'ph', 'indiehackers', '36kr', 'huxiu', 'tiehan'}
+            and _acquisition_specificity_level(opp.customer_acquisition) >= 2
+            and not _is_generic_action_plan(opp.action_plan)
+            and _is_fast_payback_window(opp.time_to_revenue)
+        )
+    ]
+    if keep_exceptions:
+        sample = keep_exceptions[0]
+        return {
+            'suggestion': '别按来源一刀切丢掉 HN / IndieHackers / 媒体信号；只要同时满足 14 天收钱窗口和具体首客名单，允许继续跟进。',
+            'evidence': f'今天至少有 1 条这类例外样本成立，代表案例是「{sample.title}」。',
+        }
+
+    return {
+        'suggestion': '继续把“14 天内能收钱 + 首批 20 用户来源具体”当作 keep 前置条件，本轮没有足够证据支持放松。',
+        'evidence': '今天的样本没有形成单一新模式，先守住现有硬门槛比频繁改规则更稳。',
+    }
+
+
 def _annotate_phase2_assessments(opportunities: List[Opportunity]) -> dict:
     assessments = {}
     for opp in opportunities:
@@ -1258,6 +1377,381 @@ def _agent_reach_health_summary_lines() -> List[str]:
     return health_summary_lines
 
 
+def _snapshot_datetime_from_name(name: str) -> Optional[datetime]:
+    match = re.match(r'^opportunities_(\d{8})_(\d{6})\.json$', name)
+    if not match:
+        return None
+    try:
+        return datetime.strptime(match.group(1) + match.group(2), '%Y%m%d%H%M%S')
+    except ValueError:
+        return None
+
+
+def _restore_opportunity_from_dict(data: Dict[str, Any]) -> Opportunity:
+    created_at_raw = data.get('created_at')
+    created_at = datetime.now()
+    if isinstance(created_at_raw, str):
+        try:
+            created_at = datetime.fromisoformat(created_at_raw)
+        except ValueError:
+            created_at = datetime.now()
+
+    opp = Opportunity(
+        id=str(data.get('id', '')),
+        title=data.get('title', '') or '',
+        source=data.get('source', '') or '',
+        url=data.get('url', '') or '',
+        score=int(data.get('phase2_raw_score', data.get('score', 0)) or 0),
+        summary=data.get('summary', '') or '',
+        description=data.get('description', '') or '',
+        solo_feasibility=data.get('solo_feasibility', '') or '',
+        agent_roles=list(data.get('agent_roles', []) or []),
+        startup_cost=data.get('startup_cost', '') or '',
+        time_to_revenue=data.get('time_to_revenue', '') or '',
+        revenue_model=data.get('revenue_model', '') or '',
+        monthly_potential=data.get('monthly_potential', '') or '',
+        automation_rate=data.get('automation_rate', '') or '',
+        customer_acquisition=data.get('customer_acquisition', '') or '',
+        risks=data.get('risks', '') or '',
+        action_plan=data.get('action_plan', '') or '',
+        tags=list(data.get('tags', []) or []),
+        source_url=data.get('source_url', '') or '',
+        research_links=list(data.get('research_links', []) or []),
+        created_at=created_at,
+    )
+
+    for field_name in (
+        'phase2_adjusted_score',
+        'phase2_decision_label',
+        'phase2_verdict',
+        'phase2_wedge',
+        'phase2_who_pays',
+        'phase2_first_users',
+        'phase2_solo_logic',
+        'phase2_not_crushed',
+        'phase2_paid_mvp',
+        'phase2_target_user',
+        'phase2_trigger_event',
+        'phase2_deliverable',
+        'phase2_current_alternative',
+        'phase2_why_existing_bad',
+        'phase2_why_now',
+        'phase2_why_fit_for_user',
+        'phase2_boundary',
+        'phase2_final_conclusion',
+        'phase2_filtered_reason',
+        'phase2_raw_score',
+        'phase2_evidence_score',
+    ):
+        if field_name in data:
+            setattr(opp, field_name, data.get(field_name))
+    return opp
+
+
+def _load_snapshot_records(window_days: int = 7, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
+    ref_now = now or datetime.now()
+    cutoff = ref_now - timedelta(days=max(1, window_days))
+    snapshot_files: List[tuple[datetime, str]] = []
+
+    if not os.path.exists(DATA_DIR):
+        return []
+
+    for name in os.listdir(DATA_DIR):
+        snapshot_at = _snapshot_datetime_from_name(name)
+        if not snapshot_at or snapshot_at < cutoff:
+            continue
+        snapshot_files.append((snapshot_at, os.path.join(DATA_DIR, name)))
+
+    snapshot_files.sort(key=lambda item: item[0])
+    records: List[Dict[str, Any]] = []
+    for snapshot_at, path in snapshot_files:
+        try:
+            with open(path, 'r', encoding='utf-8') as fh:
+                payload = json.load(fh)
+        except Exception:
+            continue
+        if not isinstance(payload, list):
+            continue
+        for raw in payload:
+            if not isinstance(raw, dict):
+                continue
+            opp = _restore_opportunity_from_dict(raw)
+            assessment = _build_phase2_assessment(opp)
+            records.append({
+                'snapshot_at': snapshot_at,
+                'snapshot_day': snapshot_at.strftime('%Y-%m-%d'),
+                'path': path,
+                'opp': opp,
+                'assessment': assessment,
+                'fingerprint': _fingerprint_opportunity(opp),
+            })
+    return records
+
+
+def _weekly_focus_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [
+        record for record in records
+        if record['assessment'].verdict in {'keep', 'watch'}
+        or record['assessment'].adjusted_score >= PHASE2_WATCH_MIN_SCORE
+        or record['assessment'].evidence_score >= 4
+    ]
+
+
+def _weekly_pain_label(assessment: ScreeningAssessment) -> str:
+    return _clean_text(assessment.trigger_event or assessment.deliverable or assessment.category_label or '用户最着急解决这个问题时')
+
+
+def _summarize_weekly_clusters(records: List[Dict[str, Any]], label_fn, reason_fn, limit: int = 3) -> List[Dict[str, Any]]:
+    buckets: Dict[str, Dict[str, Any]] = {}
+    for record in records:
+        opp = record['opp']
+        assessment = record['assessment']
+        label = _clean_text(label_fn(opp, assessment))
+        if not label:
+            continue
+        key = label.lower()
+        bucket = buckets.setdefault(key, {
+            'label': label,
+            'count': 0,
+            'days': set(),
+            'sources': set(),
+            'reasons': [],
+            'sample_title': opp.title,
+        })
+        bucket['count'] += 1
+        bucket['days'].add(record['snapshot_day'])
+        if opp.source:
+            bucket['sources'].add(opp.source)
+        reason = _clean_text(reason_fn(opp, assessment))
+        if reason:
+            bucket['reasons'].append(reason)
+
+    ranked = sorted(
+        buckets.values(),
+        key=lambda item: (item['count'], len(item['days']), len(item['sources'])),
+        reverse=True,
+    )
+    return ranked[:limit]
+
+
+def _best_weekly_direction(records: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not records:
+        return None
+
+    groups: Dict[str, Dict[str, Any]] = {}
+    for record in records:
+        opp = record['opp']
+        assessment = record['assessment']
+        group_key = '|'.join([
+            _clean_text(assessment.deliverable).lower(),
+            _clean_text(assessment.target_user).lower(),
+        ])
+        if not group_key.strip('|'):
+            continue
+        group = groups.setdefault(group_key, {
+            'records': [],
+            'days': set(),
+            'sources': set(),
+            'keep': 0,
+            'watch': 0,
+            'score_total': 0,
+            'evidence_total': 0,
+        })
+        group['records'].append(record)
+        group['days'].add(record['snapshot_day'])
+        if opp.source:
+            group['sources'].add(opp.source)
+        if assessment.verdict == 'keep':
+            group['keep'] += 1
+        elif assessment.verdict == 'watch':
+            group['watch'] += 1
+        group['score_total'] += assessment.adjusted_score
+        group['evidence_total'] += assessment.evidence_score
+
+    if not groups:
+        return None
+
+    def _group_score(group: Dict[str, Any]) -> float:
+        count = max(1, len(group['records']))
+        avg_score = group['score_total'] / count
+        avg_evidence = group['evidence_total'] / count
+        return (
+            group['keep'] * 8
+            + group['watch'] * 4
+            + len(group['days']) * 2
+            + len(group['sources']) * 1.5
+            + avg_score / 10
+            + avg_evidence
+        )
+
+    best_group = max(groups.values(), key=_group_score)
+    representative = max(
+        best_group['records'],
+        key=lambda item: (
+            item['assessment'].verdict == 'keep',
+            item['assessment'].adjusted_score,
+            item['assessment'].evidence_score,
+        ),
+    )
+    return {
+        'representative': representative,
+        'days': len(best_group['days']),
+        'sources': len(best_group['sources']),
+        'count': len(best_group['records']),
+        'keep': best_group['keep'],
+        'watch': best_group['watch'],
+        'avg_score': round(best_group['score_total'] / max(1, len(best_group['records'])), 1),
+        'avg_evidence': round(best_group['evidence_total'] / max(1, len(best_group['records'])), 1),
+    }
+
+
+def _weekly_direction_confidence(direction: Dict[str, Any]) -> str:
+    if direction['keep'] >= 1 or direction['avg_evidence'] >= 5:
+        return '本周已经出现值得认真验证的单一方向。'
+    if direction['watch'] >= 2 or direction['days'] >= 2:
+        return '证据还没硬到直接开做，但这是本周唯一值得继续压缩验证的问题。'
+    return '证据偏弱，先把这一个方向收窄验证，不要同时追别的题。'
+
+
+def save_weekly_report(window_days: int = 7, now: Optional[datetime] = None) -> Optional[str]:
+    """输出深筛周报（markdown + latest）。"""
+    ref_now = now or datetime.now()
+    ts = ref_now.strftime('%Y%m%d_%H%M%S')
+    report_file = os.path.join(DATA_DIR, f'weekly_report_{ts}.md')
+    latest_file = os.path.join(DATA_DIR, 'latest_weekly.md')
+    records = _load_snapshot_records(window_days=window_days, now=ref_now)
+
+    start_date = (ref_now - timedelta(days=max(1, window_days) - 1)).strftime('%Y-%m-%d')
+    end_date = ref_now.strftime('%Y-%m-%d')
+    snapshot_count = len({record['path'] for record in records})
+    unique_fingerprints = len({record['fingerprint'] for record in records})
+
+    if not records:
+        content = '\n'.join([
+            '# 深筛周报',
+            '',
+            f'- 统计窗口: {start_date} ~ {end_date}',
+            '- 结论: 当前窗口内没有可用历史快照，先继续跑每日模式积累样本。',
+            '',
+            '## 反复出现的痛点',
+            '- 暂无历史样本。',
+            '',
+            '## 重复出现的切口',
+            '- 暂无历史样本。',
+            '',
+            '## 最常见伪机会类型',
+            '- 暂无历史样本。',
+            '',
+            '## 本周唯一值得认真验证的方向',
+            '- 暂无。先继续积累 3-7 天快照，再做深筛归纳。',
+            '',
+        ])
+        with open(report_file, 'w', encoding='utf-8') as fh:
+            fh.write(content)
+        with open(latest_file, 'w', encoding='utf-8') as fh:
+            fh.write(content)
+        print(f'Weekly report saved: {report_file}')
+        return report_file
+
+    focus_records = _weekly_focus_records(records)
+    dropped_records = [record for record in records if record['assessment'].verdict == 'drop']
+    pain_clusters = _summarize_weekly_clusters(
+        focus_records,
+        lambda _opp, assessment: _weekly_pain_label(assessment),
+        lambda _opp, assessment: assessment.target_user,
+        limit=4,
+    )
+    wedge_clusters = _summarize_weekly_clusters(
+        focus_records,
+        lambda _opp, assessment: assessment.deliverable,
+        lambda _opp, assessment: _phase2_signal_summary(_opp, assessment),
+        limit=4,
+    )
+    pseudo_clusters = _summarize_weekly_clusters(
+        dropped_records,
+        lambda opp, assessment: _pseudo_opportunity_type(opp, assessment),
+        lambda opp, assessment: _concise_drop_reason(opp, assessment),
+        limit=4,
+    )
+    direction_candidates = [record for record in focus_records if record['assessment'].verdict in {'keep', 'watch'}]
+    direction = _best_weekly_direction(direction_candidates)
+
+    verdict_counts = defaultdict(int)
+    for record in records:
+        verdict_counts[record['assessment'].verdict] += 1
+
+    lines = [
+        '# 深筛周报',
+        '',
+        f'- 统计窗口: {start_date} ~ {end_date}',
+        f'- 覆盖快照: {snapshot_count} 份',
+        f'- 去重后机会指纹: {unique_fingerprints}',
+        f'- 决策分布: keep {verdict_counts["keep"]} / watch {verdict_counts["watch"]} / drop {verdict_counts["drop"]}',
+        '',
+        '## 反复出现的痛点',
+    ]
+
+    if pain_clusters:
+        for cluster in pain_clusters:
+            sources = '、'.join(sorted(cluster['sources'])[:3]) or '未知来源'
+            lines.append(
+                f'- {cluster["label"]}: {cluster["count"]} 次，出现在 {len(cluster["days"])} 天，主要指向 {sources}。'
+            )
+    else:
+        lines.append('- 本周没有形成可复用的痛点聚类。')
+    lines.append('')
+
+    lines.append('## 重复出现的切口')
+    if wedge_clusters:
+        for cluster in wedge_clusters:
+            reason = cluster['reasons'][0] if cluster['reasons'] else '证据待补充'
+            lines.append(
+                f'- {cluster["label"]}: {cluster["count"]} 次，出现在 {len(cluster["days"])} 天；代表信号是 {reason}。'
+            )
+    else:
+        lines.append('- 本周没有出现重复到值得命名的切口。')
+    lines.append('')
+
+    lines.append('## 最常见伪机会类型')
+    if pseudo_clusters:
+        for cluster in pseudo_clusters:
+            reason = cluster['reasons'][0] if cluster['reasons'] else '今天看不到可执行验证路径。'
+            lines.append(f'- {cluster["label"]}: {cluster["count"]} 次；共性问题是 {reason}')
+    else:
+        lines.append('- 本周 drop 样本不足，暂时没有稳定伪机会类型。')
+    lines.append('')
+
+    lines.append('## 本周唯一值得认真验证的方向')
+    if direction:
+        record = direction['representative']
+        opp = record['opp']
+        assessment = record['assessment']
+        lines.extend([
+            f'- 切口名称: {assessment.deliverable}',
+            f'- 目标用户: {assessment.target_user}',
+            f'- 高频场景: {assessment.trigger_event}',
+            f'- 本周证据: {direction["count"]} 次出现，覆盖 {direction["days"]} 天、{direction["sources"]} 个来源；平均信号 {direction["avg_score"]}，平均证据 {direction["avg_evidence"]}。',
+            f'- 为什么是它: {_weekly_direction_confidence(direction)}',
+            f'- 下周只验证什么: 先验证 {assessment.target_user} 是否愿意为“{assessment.deliverable}”付第一笔钱，不扩成功能平台。',
+            f'- 参考样本: {opp.title} | {opp.url}',
+            '',
+        ])
+    else:
+        lines.extend([
+            '- 暂无。当前窗口里还没有出现一个值得单点加码的方向。',
+            '',
+        ])
+
+    content = '\n'.join(lines)
+    with open(report_file, 'w', encoding='utf-8') as fh:
+        fh.write(content)
+    with open(latest_file, 'w', encoding='utf-8') as fh:
+        fh.write(content)
+
+    print(f'Weekly report saved: {report_file}')
+    return report_file
+
+
 def save_phase1_report(opportunities: List[Opportunity], assessments: Optional[dict] = None, run_notes: Optional[List[str]] = None):
     """输出 Phase 1 solo-venture screener（markdown + latest）。"""
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -1267,6 +1761,7 @@ def save_phase1_report(opportunities: List[Opportunity], assessments: Optional[d
     assessments = assessments or {opp.id: _build_phase2_assessment(opp) for opp in opportunities}
     kept, watchlist, dropped = _bucket_phase2_candidates(opportunities, assessments)
     primary, remaining_watchlist = _primary_candidate(kept, watchlist)
+    rule_adjustment = _daily_rule_adjustment(opportunities, assessments)
     verdict_counts = {'keep': 0, 'watch': 0, 'drop': 0}
     for opp in opportunities:
         verdict = assessments[opp.id].verdict
@@ -1283,6 +1778,12 @@ def save_phase1_report(opportunities: List[Opportunity], assessments: Optional[d
     lines.extend(_agent_reach_health_summary_lines())
     if run_notes:
         lines.extend(['## Run Notes', *[f'- {note}' for note in run_notes], ''])
+    lines.extend([
+        '## 今日最该调整的一条筛选规则',
+        f'- 建议: {rule_adjustment["suggestion"]}',
+        f'- 依据: {rule_adjustment["evidence"]}',
+        '',
+    ])
 
     if primary:
         assessment = assessments[primary.id]
@@ -1967,13 +2468,23 @@ def generate_mvps(opportunities: List[Opportunity]):
     print(f"\n✅ Generated {generated}/{len(opportunities[:2])} MVPs")
 
 
-def print_phase1_results(kept: List[Opportunity], watchlist: List[Opportunity], dropped: List[Opportunity], total_count: int, assessments: Optional[dict] = None):
+def print_phase1_results(
+    kept: List[Opportunity],
+    watchlist: List[Opportunity],
+    dropped: List[Opportunity],
+    total_count: int,
+    assessments: Optional[dict] = None,
+    rule_adjustment: Optional[Dict[str, str]] = None,
+):
     """打印 Phase 1 screener 摘要。"""
     assessments = assessments or {}
+    rule_adjustment = rule_adjustment or _daily_rule_adjustment(kept + watchlist + dropped, assessments)
     primary, remaining_watchlist = _primary_candidate(kept, watchlist)
     print("\n" + "=" * 80)
     print(f"Phase 1 Solo Venture Screener | 候选池 {total_count} 条")
     print("=" * 80 + "\n")
+    print(f"今日最该调整的一条筛选规则：{rule_adjustment['suggestion']}")
+    print(f"依据：{rule_adjustment['evidence']}\n")
 
     if primary:
         assessment = assessments.get(primary.id)
@@ -2057,9 +2568,10 @@ def print_results(opportunities: List[Opportunity]):
 
 
 def _finalize_top0_run(reason: str):
+    rule_adjustment = _daily_rule_adjustment([], {})
     save_phase1_report([], {}, run_notes=[reason])
     feishu_doc_url = sync_report_to_feishu()
-    print_phase1_results([], [], [], 0, {})
+    print_phase1_results([], [], [], 0, {}, rule_adjustment=rule_adjustment)
     if feishu_doc_url:
         print(f"Verified Feishu doc URL: {feishu_doc_url}")
     print("No kept candidate to send via direct Feishu message")
@@ -2067,19 +2579,12 @@ def _finalize_top0_run(reason: str):
     print("MVP generation disabled in Phase 1; use --enable-mvp-generation to override")
 
 
-def main():
-    """主函数"""
-    # 验证配置
-    try:
-        validate_config()
-    except ValueError as e:
-        print(f"❌ 配置错误：{e}")
-        print("请检查 .env 文件配置")
-        sys.exit(1)
-    
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="调研 Agent - 发现产品机会")
     parser.add_argument('--test', action='store_true', help='测试模式')
     parser.add_argument('--debug', action='store_true', help='调试模式')
+    parser.add_argument('--weekly-report', action='store_true', help='基于历史快照生成深筛周报')
+    parser.add_argument('--weekly-days', type=int, default=7, help='深筛周报回看天数（默认 7）')
     parser.add_argument('--hn-limit', type=int, default=30, help='HN 获取数量')
     parser.add_argument('--ph-limit', type=int, default=20, help='PH 获取数量')
     parser.add_argument('--min-score', type=int, default=60, help='最低分数')
@@ -2092,7 +2597,12 @@ def main():
     parser.add_argument('--indie-mode', action='store_true', help='一人公司模式：专注 Indie Hacker/微 SaaS/自动化机会')
     parser.add_argument('--enable-github-issues', action='store_true', help='显式启用 GitHub issue 创建（默认关闭）')
     parser.add_argument('--enable-mvp-generation', action='store_true', help='显式启用 MVP 自动生成（默认关闭）')
-    
+    return parser
+
+
+def main():
+    """主函数"""
+    parser = build_arg_parser()
     args = parser.parse_args()
     
     # 设置调试模式
@@ -2105,6 +2615,20 @@ def main():
     # 设置日志
     logger = setup_logging()
     logger.info("Starting research agent...")
+
+    if args.weekly_report:
+        report_file = save_weekly_report(window_days=max(1, args.weekly_days))
+        if report_file:
+            print(f"Weekly report ready: {report_file}")
+        return
+
+    # 验证配置
+    try:
+        validate_config()
+    except ValueError as e:
+        print(f"❌ 配置错误：{e}")
+        print("请检查 .env 文件配置")
+        sys.exit(1)
     
     # 检查 API Key
     if not BAILIAN_API_KEY:
@@ -2149,11 +2673,19 @@ def main():
         assessments = _annotate_phase2_assessments(opportunities)
         opportunities = rerank_for_solo(opportunities, assessments)
         kept_candidates, watch_candidates, dropped_candidates = _bucket_phase2_candidates(opportunities, assessments)
+        rule_adjustment = _daily_rule_adjustment(opportunities, assessments)
 
         save_results(opportunities)
         save_phase1_report(opportunities, assessments)
         feishu_doc_url = sync_report_to_feishu()
-        print_phase1_results(kept_candidates, watch_candidates, dropped_candidates, len(opportunities), assessments)
+        print_phase1_results(
+            kept_candidates,
+            watch_candidates,
+            dropped_candidates,
+            len(opportunities),
+            assessments,
+            rule_adjustment=rule_adjustment,
+        )
         if feishu_doc_url:
             print(f"Verified Feishu doc URL: {feishu_doc_url}")
         if kept_candidates:

@@ -8,6 +8,7 @@ from unittest.mock import patch
 from main import (
     _build_phase2_assessment,
     _bucket_phase2_candidates,
+    _daily_rule_adjustment,
     _filtered_reason,
     _sanitize_secret_text,
     _wedge_statement,
@@ -281,6 +282,36 @@ class Phase2ScreeningTests(unittest.TestCase):
         self.assertIn("- 机会信号:", report)
         self.assertIn("- 验证动作（landing page / 7 day MVP / 丢弃）:", report)
         self.assertNotIn("/100", report)
+
+    def test_daily_rule_adjustment_prefers_generic_acquisition_hardening_when_repeated(self):
+        opps = []
+        for idx in range(3):
+            opps.append(
+                Opportunity(
+                    id=f"acq-{idx}",
+                    title=f"Ops copilot {idx}",
+                    source="reddit_r/entrepreneur",
+                    url=f"https://example.com/acq-{idx}",
+                    score=82,
+                    description="帮助小型 SaaS 团队更快处理客服工单，目标用户为 5-20 人 SaaS 团队创始人。",
+                    summary="问题存在，但当前分发证据还比较泛。",
+                    startup_cost="$1-5k",
+                    time_to_revenue="14天",
+                    revenue_model="订阅",
+                    monthly_potential="$10-50k",
+                    automation_rate="90%+",
+                    customer_acquisition="SEO and social media",
+                    risks="需求存在，但分发信号仍然很弱。",
+                    action_plan="先卖一份工单分流与回复建议清单，拿 10 个客服团队做收费试点。",
+                    tags=["SaaS", "B2B", "客服", "AI"],
+                )
+            )
+
+        assessments = {opp.id: _build_phase2_assessment(opp) for opp in opps}
+        suggestion = _daily_rule_adjustment(opps, assessments)
+
+        self.assertIn("首批 20 用户来源仍是 SEO / 社媒 / 泛 cold outreach", suggestion["suggestion"])
+        self.assertIn("今天有 3 条样本", suggestion["evidence"])
 
 
 if __name__ == "__main__":

@@ -42,9 +42,28 @@ python3 main.py
 
 输出：
 - 终端输出 Phase 1 screener（今日唯一候选 + 继续观察 + 今天不值得做）
+- 每日报告会显式输出“今日最该调整的一条筛选规则”
 - JSON 保存到 `data/` 目录
 - Markdown 报告保存为 `data/phase1_report_*.md` 与 `data/latest_phase1.md`
+- 深筛周报可额外生成 `data/weekly_report_*.md` 与 `data/latest_weekly.md`
 - 日志保存到 `logs/` 目录
+
+## 深筛周报
+
+基于最近几天的 `data/opportunities_*.json` 历史快照做二次归纳，不重新调用采集和分析接口：
+
+```bash
+python3 main.py --weekly-report
+python3 main.py --weekly-report --weekly-days 10
+```
+
+周报会固定输出四块：
+- 反复出现的痛点
+- 重复出现的切口
+- 最常见伪机会类型
+- 本周唯一值得认真验证的方向
+
+这个模式默认只写本地 markdown，不改动现有每日 Feishu 同步和索引行为。
 
 ## 配置 OpenClaw Cron
 
@@ -70,6 +89,8 @@ python3 main.py --help
 --hn-limit      HN 获取数量 (默认 30)
 --ph-limit      PH 获取数量 (默认 20)
 --min-score     最低分数阈值 (默认 60)
+--weekly-report 基于历史快照生成深筛周报
+--weekly-days   深筛周报回看天数 (默认 7)
 --enable-github-issues  显式启用 GitHub issue 创建
 --enable-mvp-generation 显式启用 MVP 自动生成
 --debug         调试模式

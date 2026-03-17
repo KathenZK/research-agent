@@ -72,10 +72,12 @@ class ReportVerificationTests(unittest.TestCase):
                 report = fh.read()
             self.assertIn("- 结论: 丢弃。今日没有值得继续验证的切口。", report)
             self.assertIn("## Run Notes", report)
+            self.assertIn("## 今日最该调整的一条筛选规则", report)
             self.assertIn("## 今日唯一候选", report)
             self.assertIn(reason, report)
 
             console = stdout.getvalue()
+            self.assertIn("今日最该调整的一条筛选规则：继续把“14 天内能收钱 + 首批 20 用户来源具体”当作硬门槛", console)
             self.assertIn("今日唯一候选 | 丢弃", console)
             self.assertIn("No kept candidate to send via direct Feishu message", console)
 
@@ -93,6 +95,7 @@ class ReportVerificationTests(unittest.TestCase):
             with open(latest_report, "r", encoding="utf-8") as fh:
                 report = fh.read()
             self.assertIn("- 结论: 做 landing page 验证。", report)
+            self.assertIn("## 今日最该调整的一条筛选规则", report)
             self.assertIn("## 今日唯一候选", report)
             self.assertIn("- 切口名称: AI 编程评审清单与代码库 playbook 试点", report)
             self.assertIn("- 验证动作（landing page / 7 day MVP / 丢弃）: **做 landing page 验证**", report)
