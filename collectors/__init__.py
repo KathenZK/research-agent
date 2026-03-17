@@ -7,6 +7,8 @@ from .indiehackers import IndieHackersCollector
 from .reddit import RedditCollector
 from .github_trending import GitHubTrendingCollector
 from .agent_reach_bridge import AgentReachBridge
+from .appstore_reviews import AppStoreReviewsCollector
+from .github_issues import GitHubIssuesCollector
 
 __all__ = [
     'HNCollector',
@@ -15,5 +17,7 @@ __all__ = [
     'IndieHackersCollector',
     'RedditCollector',
     'GitHubTrendingCollector',
-    'AgentReachBridge'
+    'AgentReachBridge',
+    'AppStoreReviewsCollector',
+    'GitHubIssuesCollector',
 ]

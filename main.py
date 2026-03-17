@@ -32,7 +32,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from mvp_generator import MVPGenerator
 from config import DEBUG, DATA_DIR, LOG_DIR, BAILIAN_API_KEY, FEISHU_APP_ID, FEISHU_APP_SECRET, FEISHU_USER_ID, FEISHU_INDEX_DOC_TOKEN, FEISHU_DOC_SYNC_ENABLED, validate_config, GITHUB_TOKEN, GITHUB_REPO
-from collectors import HNCollector, PHCollector, ChineseMediaCollector, GitHubTrendingCollector, AgentReachBridge
+from collectors import (
+    AgentReachBridge,
+    AppStoreReviewsCollector,
+    ChineseMediaCollector,
+    GitHubIssuesCollector,
+    GitHubTrendingCollector,
+    HNCollector,
+    PHCollector,
+)
 from collectors.indiehackers import IndieHackersCollector
 from collectors.reddit import RedditCollector
 from analyzers import BailianAnalyzer
@@ -89,7 +97,9 @@ def setup_logging():
 
 def collect_data(hn_limit: int = 10, ph_limit: int = 5, media_hours: int = 48,
                  indie_limit: int = 15, reddit_limit: int = 10, github_limit: int = 10,
-                 enable_agent_reach: bool = False, ar_limit: int = 10) -> List[dict]:
+                 enable_agent_reach: bool = False, ar_limit: int = 10,
+                 enable_app_store_reviews: bool = False, app_store_review_limit: int = 8,
+                 enable_github_pain_issues: bool = False, github_pain_limit: int = 8) -> List[dict]:
     """收集数据"""
     import logging
     logger = logging.getLogger(__name__)
@@ -129,6 +139,20 @@ def collect_data(hn_limit: int = 10, ph_limit: int = 5, media_hours: int = 48,
     gh_items = gh_collector.fetch(limit=github_limit)
     logger.info(f"Got {len(gh_items)} GitHub Trending items")
     items.extend(gh_items)
+
+    if enable_app_store_reviews:
+        logger.info(f"Fetching App Store reviews (limit={app_store_review_limit})...")
+        app_store_collector = AppStoreReviewsCollector()
+        app_store_items = app_store_collector.fetch(limit=app_store_review_limit)
+        logger.info(f"Got {len(app_store_items)} App Store review items")
+        items.extend(app_store_items)
+
+    if enable_github_pain_issues:
+        logger.info(f"Fetching GitHub issue pains (limit={github_pain_limit})...")
+        github_issue_collector = GitHubIssuesCollector()
+        github_issue_items = github_issue_collector.fetch(limit=github_pain_limit)
+        logger.info(f"Got {len(github_issue_items)} GitHub issue pain items")
+        items.extend(github_issue_items)
 
     # fallback legacy Reddit collector (kept for compatibility)
     if not enable_agent_reach:
@@ -678,8 +702,10 @@ def _default_first_users_source(opp: Opportunity, assessment: Optional[Screening
         'ph': '从 Product Hunt 发布页评论者、投票用户和同类产品的早期支持者里找首批试用者。',
         'reddit': '从对应 subreddit 的发帖者、评论者和求推荐帖子里私信约访。',
         'reddit_r/saas': '从 r/SaaS 的发帖者、评论者和求工具帖里私信约访。',
+        'appstore_reviews': '从对应 App 的差评用户、竞品差评区和评论里提到的替代方案用户中定向约访。',
         'github': '从相关仓库的 issue、discussion、star 用户和 README 反馈里找早期用户。',
         'github_trending': '从相关仓库的 issue、discussion、star 用户和 README 反馈里找早期用户。',
+        'github_issues': '从对应仓库的 issue 提交者、评论者和相关集成服务商客户里定向约访。',
         'indiehackers': '从 IndieHackers 发帖作者、评论区和同类项目创始人网络中直接约访。',
         '36kr': '从报道里出现的赛道从业者、微信群和相关服务商客户名单中做定向外联。',
         'huxiu': '从报道里出现的赛道从业者、微信群和相关服务商客户名单中做定向外联。',
@@ -776,7 +802,7 @@ def _build_phase2_assessment(opp: Opportunity) -> ScreeningAssessment:
         adjusted_score -= 8
 
     source = (opp.source or '').lower()
-    if source.startswith('reddit') or source in {'github', 'github_trending', 'x'}:
+    if source.startswith('reddit') or source in {'github', 'github_trending', 'github_issues', 'x', 'appstore_reviews'}:
         evidence_score += 1
         adjusted_score += 2
         strengths.append(f'{opp.source} 更接近真实需求现场')
@@ -2594,6 +2620,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--github-limit', type=int, default=10, help='GitHub Trending 获取数量')
     parser.add_argument('--enable-agent-reach', action='store_true', help='启用 Agent Reach 桥接采集（X/YouTube/Reddit）')
     parser.add_argument('--ar-limit', type=int, default=10, help='Agent Reach 每平台抓取数量')
+    parser.add_argument('--enable-app-store-reviews', action='store_true', help='启用 App Store 差评采集（默认关闭）')
+    parser.add_argument('--app-store-review-limit', type=int, default=8, help='App Store 差评采集数量（默认 8）')
+    parser.add_argument('--enable-github-pain-issues', action='store_true', help='启用 GitHub issue 痛点采集（默认关闭）')
+    parser.add_argument('--github-pain-limit', type=int, default=8, help='GitHub issue 痛点采集数量（默认 8）')
     parser.add_argument('--indie-mode', action='store_true', help='一人公司模式：专注 Indie Hacker/微 SaaS/自动化机会')
     parser.add_argument('--enable-github-issues', action='store_true', help='显式启用 GitHub issue 创建（默认关闭）')
     parser.add_argument('--enable-mvp-generation', action='store_true', help='显式启用 MVP 自动生成（默认关闭）')
@@ -2641,7 +2671,20 @@ def main():
     # 测试模式
     if args.test:
         logger.info("Test mode: fetching sample data...")
-        items = collect_data(hn_limit=5, ph_limit=3, media_hours=args.media_hours, indie_limit=min(5, args.indie_limit), reddit_limit=min(4, args.reddit_limit), github_limit=min(4, args.github_limit), enable_agent_reach=args.enable_agent_reach, ar_limit=min(5, args.ar_limit))
+        items = collect_data(
+            hn_limit=5,
+            ph_limit=3,
+            media_hours=args.media_hours,
+            indie_limit=min(5, args.indie_limit),
+            reddit_limit=min(4, args.reddit_limit),
+            github_limit=min(4, args.github_limit),
+            enable_agent_reach=args.enable_agent_reach,
+            ar_limit=min(5, args.ar_limit),
+            enable_app_store_reviews=args.enable_app_store_reviews,
+            app_store_review_limit=min(4, args.app_store_review_limit),
+            enable_github_pain_issues=args.enable_github_pain_issues,
+            github_pain_limit=min(4, args.github_pain_limit),
+        )
         print(f"Collected {len(items)} items")
         for item in items[:3]:
             print(f"  - {item['title']}")
@@ -2657,6 +2700,10 @@ def main():
         github_limit=args.github_limit,
         enable_agent_reach=args.enable_agent_reach,
         ar_limit=args.ar_limit,
+        enable_app_store_reviews=args.enable_app_store_reviews,
+        app_store_review_limit=args.app_store_review_limit,
+        enable_github_pain_issues=args.enable_github_pain_issues,
+        github_pain_limit=args.github_pain_limit,
     )
     opportunities = asyncio.run(analyze_items_async(items, min_score=args.min_score))
 

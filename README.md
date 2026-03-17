@@ -91,11 +91,17 @@ python3 main.py --help
 --min-score     最低分数阈值 (默认 60)
 --weekly-report 基于历史快照生成深筛周报
 --weekly-days   深筛周报回看天数 (默认 7)
+--enable-app-store-reviews    启用 App Store 差评采集
+--app-store-review-limit      App Store 差评采集数量 (默认 8)
+--enable-github-pain-issues   启用 GitHub issue 痛点采集
+--github-pain-limit           GitHub issue 痛点采集数量 (默认 8)
 --enable-github-issues  显式启用 GitHub issue 创建
 --enable-mvp-generation 显式启用 MVP 自动生成
 --debug         调试模式
 --test          测试模式
 ```
+
+默认保持保守：`App Store reviews` 和 `GitHub issue pains` 都是显式开启，避免日常自动化因为新源噪音突然放量。
 
 ## 输出示例
 
@@ -148,11 +154,15 @@ Feishu doc sync blocked: outbound DNS/network access to open.feishu.cn is unavai
 
 ## 扩展数据源
 
-编辑 `collectors/` 目录添加新的数据源：
+当前新增了两类高价值、低摩擦数据源：
 
-- `appstore.py` - Appstore 榜单
-- `xiaohongshu.py` - 小红书
-- `weibo.py` - 微博热点
+- `App Store reviews`
+  用法：`python3 main.py --enable-app-store-reviews --app-store-review-limit 8`
+  采集逻辑：抓取 Business / Productivity 榜单头部 App 的近期差评，优先保留 1-3 星、文本足够长的真实抱怨。
+
+- `GitHub issue pains`
+  用法：`python3 main.py --enable-github-pain-issues --github-pain-limit 8`
+  采集逻辑：抓取一组高杠杆开源产品仓库中高评论的 open issue，优先保留带 enhancement / bug / feature request 等痛点讨论。
 
 ## License
 
