@@ -42,6 +42,9 @@ PHASE1_FILTER_LIMIT = 5
 PHASE2_WATCH_LIMIT = 3
 PHASE2_KEEP_MIN_SCORE = 83
 PHASE2_WATCH_MIN_SCORE = 72
+FINAL_ACTION_LANDING_PAGE = '做 landing page 验证'
+FINAL_ACTION_7DAY_MVP = '做 7 天 MVP 验证'
+FINAL_ACTION_DROP = '丢弃'
 
 
 @dataclass
@@ -474,17 +477,17 @@ def _signal_strength_label(score: int) -> str:
 
 def _decision_label(score: int, verdict: Optional[str] = None) -> str:
     if verdict == 'keep':
-        return '立即验证'
+        return FINAL_ACTION_7DAY_MVP
     if verdict == 'watch':
-        return '保留观察'
+        return FINAL_ACTION_LANDING_PAGE
     if verdict == 'drop':
-        return '暂不投入' if score >= 60 else '直接过滤'
+        return FINAL_ACTION_DROP
     grade = _score_grade(score)
     mapping = {
-        'A': '立即验证',
-        'B': '保留观察',
-        'C': '暂不投入',
-        'D': '直接过滤',
+        'A': FINAL_ACTION_7DAY_MVP,
+        'B': FINAL_ACTION_LANDING_PAGE,
+        'C': FINAL_ACTION_LANDING_PAGE,
+        'D': FINAL_ACTION_DROP,
     }
     return mapping[grade]
 
@@ -1037,6 +1040,94 @@ def _smallest_paid_mvp(opp: Opportunity, assessment: Optional[ScreeningAssessmen
     return f'先卖一个只承诺“{deliverable}”的 {model} 试点，先用表单/脚本/人工兜底把首单交付出来。'
 
 
+def _high_frequency_scenario(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
+    assessment = assessment or _build_phase2_assessment(opp)
+    return assessment.trigger_event or '用户开始用人工流程兜底这个问题时'
+
+
+def _current_alternative(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
+    assessment = assessment or _build_phase2_assessment(opp)
+    if assessment.frontline_hits:
+        names = '、'.join(assessment.frontline_hits[:2])
+        return f'人工流程、Excel/表单，加上 {names} 这类通用或原生方案。'
+    if assessment.category_label:
+        return f'人工流程、Excel/表单，以及泛 {assessment.category_label} 工具。'
+    return '人工流程、Excel/表单和零散脚本。'
+
+
+def _why_existing_solution_bad(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
+    assessment = assessment or _build_phase2_assessment(opp)
+    if assessment.frontline_hits:
+        names = '、'.join(assessment.frontline_hits[:2])
+        return f'{names} 这类方案更偏通用平台，不会只为“{assessment.deliverable}”这个单结果优化；用户最后还是得自己补人工。'
+    if assessment.crowded_hits:
+        return f'现有替代方案大多覆盖泛需求，不会围绕“{assessment.deliverable}”这个触发场景给出可直接付费的单点交付。'
+    return f'现有替代方案要么太泛，要么还是人工兜底，没把“{assessment.deliverable}”压成可直接购买的结果。'
+
+
+def _why_now_worth_doing(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
+    assessment = assessment or _build_phase2_assessment(opp)
+    reasons = list(assessment.strengths[:2])
+    if opp.source:
+        reasons.append(f'信号直接来自 {opp.source} 的前线讨论')
+    if not reasons:
+        reasons.append('这个问题已经逼着用户在真实工作流里找临时解法')
+    return '；'.join(reasons[:3]) + '。'
+
+
+def _why_fit_for_user(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
+    assessment = assessment or _build_phase2_assessment(opp)
+    target = assessment.target_user or '这批用户'
+    scenario = assessment.trigger_event or '问题爆发时'
+    deliverable = assessment.deliverable or '这个结果'
+    return f'{target} 会在 {scenario} 立刻感受到损失或延误；只要你直接交付“{deliverable}”，他们不需要先改流程就能试用。'
+
+
+def _do_not_scale_boundary(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
+    assessment = assessment or _build_phase2_assessment(opp)
+    not_crushed = _why_not_crushed(opp, assessment)
+    return f'别做 {assessment.avoid_label}。{not_crushed}'
+
+
+def _final_conclusion(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
+    assessment = assessment or _build_phase2_assessment(opp)
+    action = _decision_label(opp.score, assessment.verdict)
+    if assessment.verdict == 'keep':
+        return f'{action}。先把“{assessment.deliverable}”卖给最先痛的那批 {assessment.target_user}，不要扩成功能平台。'
+    if assessment.verdict == 'watch':
+        return f'{action}。先验证 {assessment.target_user} 是否愿意为“{assessment.deliverable}”留下联系方式或预约沟通，再决定要不要做 7 天 MVP。'
+    return f'{action}。{_filtered_reason(opp, assessment)}'
+
+
+def _primary_candidate(kept: List[Opportunity], watchlist: List[Opportunity]) -> tuple[Optional[Opportunity], List[Opportunity]]:
+    if kept:
+        return kept[0], watchlist
+    if watchlist:
+        return watchlist[0], watchlist[1:]
+    return None, []
+
+
+def _unique_candidate_card_lines(opp: Opportunity, assessment: ScreeningAssessment) -> List[str]:
+    return [
+        '## 今日唯一候选',
+        f'- 切口名称: {assessment.deliverable}',
+        f'- 目标用户: {assessment.target_user}',
+        f'- 高频场景: {_high_frequency_scenario(opp, assessment)}',
+        f'- 当前替代方案: {_current_alternative(opp, assessment)}',
+        f'- 为什么现有方案不好: {_why_existing_solution_bad(opp, assessment)}',
+        f'- 为什么现在值得做: {_why_now_worth_doing(opp, assessment)}',
+        f'- 为什么适合用户: {_why_fit_for_user(opp, assessment)}',
+        f'- 6 周最小收费版本: {_smallest_paid_mvp(opp, assessment)}',
+        f'- 首批 20 用户从哪里来: {_first_20_users_source(opp, assessment)}',
+        f'- 验证动作（landing page / 7 day MVP / 丢弃）: **{_decision_label(opp.score, assessment.verdict)}**',
+        f'- 不该做大的边界: {_do_not_scale_boundary(opp, assessment)}',
+        f'- 最终结论: {_final_conclusion(opp, assessment)}',
+        f'- 来源: `{opp.source}`',
+        f'- 链接: {opp.url}',
+        '',
+    ]
+
+
 def _filtered_reason(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
     assessment = assessment or _build_phase2_assessment(opp)
     reasons = list(assessment.kill_reasons[:2])
@@ -1047,6 +1138,36 @@ def _filtered_reason(opp: Opportunity, assessment: Optional[ScreeningAssessment]
     if len(reasons) < 2 and len(assessment.keep_gaps) > 1:
         reasons.append(assessment.keep_gaps[1])
     return ' '.join(reasons[:2])
+
+
+def _pseudo_opportunity_type(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
+    assessment = assessment or _build_phase2_assessment(opp)
+    if assessment.category_label:
+        return f'{assessment.category_label}型机会'
+    if assessment.deliverable:
+        return f'{_truncate(assessment.deliverable, limit=28)}型机会'
+    if opp.title:
+        return f'{_truncate(opp.title, limit=28)}型机会'
+    return '泛机会'
+
+
+def _concise_drop_reason(opp: Opportunity, assessment: Optional[ScreeningAssessment] = None) -> str:
+    assessment = assessment or _build_phase2_assessment(opp)
+    if assessment.kill_reasons:
+        return _truncate(assessment.kill_reasons[0], limit=72)
+    if assessment.keep_gaps:
+        return _truncate(assessment.keep_gaps[0], limit=72)
+    return '今天看不到值得继续验证的付费与分发证据。'
+
+
+def _not_worth_doing_lines(dropped: List[Opportunity], assessments: dict) -> List[str]:
+    lines: List[str] = []
+    for opp in dropped[:5]:
+        assessment = assessments.get(opp.id) or _build_phase2_assessment(opp)
+        lines.append(
+            f'- {_pseudo_opportunity_type(opp, assessment)}: {_concise_drop_reason(opp, assessment)}'
+        )
+    return lines
 
 
 def _annotate_phase2_assessments(opportunities: List[Opportunity]) -> dict:
@@ -1063,6 +1184,15 @@ def _annotate_phase2_assessments(opportunities: List[Opportunity]) -> dict:
         opp.phase2_solo_logic = _why_solo_buildable(opp, assessment)
         opp.phase2_not_crushed = _why_not_crushed(opp, assessment)
         opp.phase2_paid_mvp = _smallest_paid_mvp(opp, assessment)
+        opp.phase2_target_user = assessment.target_user
+        opp.phase2_trigger_event = assessment.trigger_event
+        opp.phase2_deliverable = assessment.deliverable
+        opp.phase2_current_alternative = _current_alternative(opp, assessment)
+        opp.phase2_why_existing_bad = _why_existing_solution_bad(opp, assessment)
+        opp.phase2_why_now = _why_now_worth_doing(opp, assessment)
+        opp.phase2_why_fit_for_user = _why_fit_for_user(opp, assessment)
+        opp.phase2_boundary = _do_not_scale_boundary(opp, assessment)
+        opp.phase2_final_conclusion = _final_conclusion(opp, assessment)
         opp.phase2_filtered_reason = _filtered_reason(opp, assessment)
         opp.phase2_raw_score = assessment.raw_score
         opp.phase2_evidence_score = assessment.evidence_score
@@ -1122,6 +1252,7 @@ def save_phase1_report(opportunities: List[Opportunity], assessments: Optional[d
 
     assessments = assessments or {opp.id: _build_phase2_assessment(opp) for opp in opportunities}
     kept, watchlist, dropped = _bucket_phase2_candidates(opportunities, assessments)
+    primary, remaining_watchlist = _primary_candidate(kept, watchlist)
     verdict_counts = {'keep': 0, 'watch': 0, 'drop': 0}
     for opp in opportunities:
         verdict = assessments[opp.id].verdict
@@ -1131,7 +1262,7 @@ def save_phase1_report(opportunities: List[Opportunity], assessments: Optional[d
         '',
         f'- 生成时间: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}',
         f'- 候选池规模: {len(opportunities)}',
-        f'- 结论: {"今日建议推进 1 个切口" if kept else "今日没有值得立刻开工的切口"}',
+        f'- 结论: {_final_conclusion(primary, assessments[primary.id]) if primary else "丢弃。今日没有值得继续验证的切口。"}',
         f'- 决策分布: keep {verdict_counts["keep"]} / watch {verdict_counts["watch"]} / drop {verdict_counts["drop"]}',
         '',
     ]
@@ -1139,41 +1270,15 @@ def save_phase1_report(opportunities: List[Opportunity], assessments: Optional[d
     if run_notes:
         lines.extend(['## Run Notes', *[f'- {note}' for note in run_notes], ''])
 
-    if kept:
-        opp = kept[0]
-        assessment = assessments[opp.id]
+    if primary:
+        assessment = assessments[primary.id]
+        lines.extend(_unique_candidate_card_lines(primary, assessment))
         lines.extend([
-            '## Recommended Bet',
-            '这是今天最值得 founder 亲自下场验证的切口。',
-            f'- 建议动作: **{_decision_label(opp.score, assessment.verdict)}**',
-            f'- 机会信号: **{_signal_strength_label(opp.score)}**',
-            f'- 证据摘要: **{_phase2_signal_summary(opp, assessment)}**',
-            f'- 来源: `{opp.source}`',
-            f'- 链接: {opp.url}',
-            '',
-            '### Wedge / 切入点',
-            _wedge_statement(opp, assessment),
-            '',
-            '### 谁会在 14 天内付钱',
-            _who_pays_in_14_days(opp, assessment),
-            '',
-            '### 前 20 个用户从哪里来',
-            _first_20_users_source(opp, assessment),
-            '',
-            '### 为什么适合 solo builder',
-            _why_solo_buildable(opp, assessment),
-            '',
-            '### 为什么不会立刻被大玩家碾压',
-            _why_not_crushed(opp, assessment),
-            '',
-            '### 最小可收费 MVP',
-            _smallest_paid_mvp(opp, assessment),
-            '',
-            '### 备注',
-            f'- 变现方式: {opp.revenue_model or "待验证"}',
-            f'- 见钱周期: {opp.time_to_revenue or "待验证"}',
-            f'- 启动成本: {opp.startup_cost or "待验证"}',
-            f'- 月潜力: {opp.monthly_potential or "待验证"}',
+            '## 决策依据',
+            f'- 机会信号: **{_signal_strength_label(primary.score)}**',
+            f'- 证据摘要: **{_phase2_signal_summary(primary, assessment)}**',
+            f'- 14 天内谁会先付钱: {_who_pays_in_14_days(primary, assessment)}',
+            f'- 一人可行性: {_why_solo_buildable(primary, assessment)}',
             '',
         ])
     else:
@@ -1183,8 +1288,11 @@ def save_phase1_report(opportunities: List[Opportunity], assessments: Optional[d
             if reason:
                 top_gap_lines.append(f'- {opp.title}: {reason}')
         lines.extend([
-            '## No Bet Today',
-            '今天没有出现值得 founder 立刻投入验证周期的切口。',
+            '## 今日唯一候选',
+            f'- 验证动作（landing page / 7 day MVP / 丢弃）: **{FINAL_ACTION_DROP}**',
+            '- 最终结论: 丢弃。今天没有出现值得继续验证的唯一候选。',
+            '',
+            '## 为什么今天没有候选',
             '缺的不是更高的分数，而是一个同时满足“14 天可收钱 + 首批用户名单明确 + 不正面撞大厂主战场”的切口。',
             '',
         ])
@@ -1192,44 +1300,33 @@ def save_phase1_report(opportunities: List[Opportunity], assessments: Optional[d
         if top_gap_lines:
             lines.append('')
 
-    if watchlist:
+    if remaining_watchlist:
         lines.extend([
-            '## Keep Warm',
-            '以下机会有局部信号，但证据还不够硬，本轮不投入 builder 周期：',
+            '## 继续观察',
+            '以下机会仍可作为候选池样本，但今天不升级为唯一候选：',
             '',
         ])
-        for idx, opp in enumerate(watchlist, 1):
+        for idx, opp in enumerate(remaining_watchlist, 1):
             assessment = assessments[opp.id]
             lines.extend([
                 f'### {idx}. {opp.title}',
-                f'- 当前建议: **{_decision_label(opp.score, assessment.verdict)}**',
+                f'- 验证动作（landing page / 7 day MVP / 丢弃）: **{_decision_label(opp.score, assessment.verdict)}**',
                 f'- 机会信号: **{_signal_strength_label(opp.score)}**',
                 f'- 证据摘要: {_phase2_signal_summary(opp, assessment)}',
-                f'- 先不推进原因: {_filtered_reason(opp, assessment)}',
-                f'- 如果继续跟进，建议切口: {_wedge_statement(opp, assessment)}',
+                f'- 最终结论: {_final_conclusion(opp, assessment)}',
                 f'- 链接: {opp.url}',
                 '',
             ])
 
     lines.extend([
-        '## Pass For Now',
-        '以下条目保留作市场样本，但本轮不建议投入产品验证资源：',
+        '## 今天不值得做',
+        '以下 3-5 条是今天明确不该继续投入的伪机会判断：',
         '',
     ])
 
     if dropped:
-        for idx, opp in enumerate(dropped, 1):
-            assessment = assessments[opp.id]
-            lines.extend([
-                f'### {idx}. {opp.title}',
-                f'- 当前建议: **{_decision_label(opp.score, assessment.verdict)}**',
-                f'- 机会信号: **{_signal_strength_label(opp.score)}**',
-                f'- 证据摘要: {_phase2_signal_summary(opp, assessment)}',
-                f'- 来源: `{opp.source}`',
-                f'- 暂缓原因: {_filtered_reason(opp, assessment)}',
-                f'- 链接: {opp.url}',
-                '',
-            ])
+        lines.extend(_not_worth_doing_lines(dropped, assessments))
+        lines.append('')
     else:
         lines.extend([
             '- 无更多可列出的过滤样本。',
@@ -1291,18 +1388,15 @@ def save_top10_report(opportunities: List[Opportunity]):
         lines += [
             f'## {idx}. {o.title}',
             f'- 机会信号: **{_signal_strength_label(o.display_score())}**',
-            f'- 建议动作: **{o.decision_label()}**',
+            f'- 验证动作（landing page / 7 day MVP / 丢弃）: **{o.decision_label()}**',
             f'- 来源: `{o.source}`',
             f'- 链接: {o.url}',
             '',
-            f'### 这是什么项目（What）',
-            _opportunity_what(o),
-            '',
-            f'### 怎么做（How）',
-            _opportunity_how(o),
-            '',
-            f'### 怎么盈利（Money）',
-            _opportunity_profit(o),
+            f'- 切口名称: {getattr(o, "phase2_deliverable", "") or _opportunity_what(o)}',
+            f'- 目标用户: {getattr(o, "phase2_target_user", "") or "待补充"}',
+            f'- 高频场景: {getattr(o, "phase2_trigger_event", "") or "待补充"}',
+            f'- 6 周最小收费版本: {getattr(o, "phase2_paid_mvp", "") or _opportunity_how(o)}',
+            f'- 最终结论: {getattr(o, "phase2_final_conclusion", "") or o.decision_label()}',
             '',
             f'### 关键指标',
             f'- 一人可行性: {o.solo_feasibility or "待分析"}',
@@ -1402,6 +1496,25 @@ def _resolve_feishu_runtime() -> tuple[Optional[str], Optional[str], Optional[st
     return node_bin, None, f'@larksuiteoapi/node-sdk not found; checked NODE_PATH candidates: {checked_text}'
 
 
+def _feishu_sync_blocker_message(text: str) -> Optional[str]:
+    normalized = (text or '').lower()
+    if not normalized:
+        return None
+    if 'node runtime not found' in normalized:
+        return 'node runtime not found; install Node.js or add node to PATH'
+    if '@larksuiteoapi/node-sdk not found' in text:
+        return text.strip()
+    if 'feishu_app_id / feishu_app_secret not configured' in normalized:
+        return 'FEISHU_APP_ID / FEISHU_APP_SECRET not configured'
+    if 'connect eperm 127.0.0.1:7897' in normalized:
+        return 'outbound Feishu API access is blocked by the current proxy/network sandbox (cannot connect to 127.0.0.1:7897)'
+    if 'getaddrinfo enotfound open.feishu.cn' in normalized or 'enotfound open.feishu.cn' in normalized:
+        return 'outbound DNS/network access to open.feishu.cn is unavailable in the current environment'
+    if any(token in normalized for token in ['econnrefused', 'etimedout', 'network error', 'socket hang up']) and 'feishu' in normalized:
+        return 'outbound network access to Feishu API is unavailable in the current environment'
+    return None
+
+
 def sync_report_to_feishu(md_filename: str = 'latest_phase1.md', title: Optional[str] = None) -> Optional[str]:
     """将指定 markdown 报告同步到 Feishu Doc，并返回可验证的真实 docx URL。"""
     if not FEISHU_DOC_SYNC_ENABLED:
@@ -1409,7 +1522,7 @@ def sync_report_to_feishu(md_filename: str = 'latest_phase1.md', title: Optional
         return None
     app_id, app_secret = _resolve_feishu_credentials()
     if _looks_like_placeholder(app_id) or _looks_like_placeholder(app_secret):
-        print("FEISHU_APP_ID / FEISHU_APP_SECRET not configured, skipping Feishu doc sync")
+        print("Feishu doc sync blocked: FEISHU_APP_ID / FEISHU_APP_SECRET not configured")
         return None
 
     md_path = os.path.join(DATA_DIR, md_filename)
@@ -1420,7 +1533,7 @@ def sync_report_to_feishu(md_filename: str = 'latest_phase1.md', title: Optional
     title = title or f"Solo Venture Screener-{datetime.now().strftime('%Y-%m-%d')}"
     node_bin, node_path, runtime_error = _resolve_feishu_runtime()
     if runtime_error:
-        print(f"Feishu doc sync unavailable: {runtime_error}")
+        print(f"Feishu doc sync blocked: {runtime_error}")
         return None
 
     node_script = r'''
@@ -1590,9 +1703,18 @@ async function insertUnderDocList(docToken, lineMarkdown) {
         if result.returncode == 0 and url:
             print(f'Feishu daily doc: {url}')
             return url
+        blocker = _feishu_sync_blocker_message(out)
+        if blocker:
+            print(f'Feishu doc sync blocked: {blocker}')
+            return None
         raise RuntimeError(out or 'unknown feishu doc sync error')
     except Exception as e:
-        print(f'Feishu doc sync failed: {e}')
+        err_text = _sanitize_secret_text(str(e), [app_id or '', app_secret or ''])
+        blocker = _feishu_sync_blocker_message(err_text)
+        if blocker:
+            print(f'Feishu doc sync blocked: {blocker}')
+        else:
+            print(f'Feishu doc sync failed: {err_text}')
         return None
     finally:
         try:
@@ -1838,48 +1960,47 @@ def generate_mvps(opportunities: List[Opportunity]):
 def print_phase1_results(kept: List[Opportunity], watchlist: List[Opportunity], dropped: List[Opportunity], total_count: int, assessments: Optional[dict] = None):
     """打印 Phase 1 screener 摘要。"""
     assessments = assessments or {}
+    primary, remaining_watchlist = _primary_candidate(kept, watchlist)
     print("\n" + "=" * 80)
     print(f"Phase 1 Solo Venture Screener | 候选池 {total_count} 条")
     print("=" * 80 + "\n")
 
-    if kept:
-        opp = kept[0]
-        assessment = assessments.get(opp.id)
-        print(f"Recommended Bet | {_decision_label(opp.score, assessment.verdict if assessment else None)} | 信号 {_signal_strength_label(opp.score)}")
+    if primary:
+        assessment = assessments.get(primary.id)
+        print(f"今日唯一候选 | {_decision_label(primary.score, assessment.verdict if assessment else None)} | 信号 {_signal_strength_label(primary.score)}")
         if assessment:
-            print(f"证据摘要：{_phase2_signal_summary(opp, assessment)}")
-        print(f"切入 wedge：{_wedge_statement(opp, assessment)}")
-        print(f"14 天收钱：{_who_pays_in_14_days(opp, assessment)}")
-        print(f"前 20 个用户：{_first_20_users_source(opp, assessment)}")
-        print(f"Solo 可行性：{_why_solo_buildable(opp, assessment)}")
-        print(f"抗巨头逻辑：{_why_not_crushed(opp, assessment)}")
-        print(f"最小收费 MVP：{_smallest_paid_mvp(opp, assessment)}")
-        print(f"链接：{opp.url}")
+            print(f"切口名称：{assessment.deliverable}")
+            print(f"目标用户：{assessment.target_user}")
+            print(f"高频场景：{_high_frequency_scenario(primary, assessment)}")
+            print(f"当前替代方案：{_current_alternative(primary, assessment)}")
+            print(f"为什么现有方案不好：{_why_existing_solution_bad(primary, assessment)}")
+            print(f"为什么现在值得做：{_why_now_worth_doing(primary, assessment)}")
+            print(f"为什么适合用户：{_why_fit_for_user(primary, assessment)}")
+            print(f"6 周最小收费版本：{_smallest_paid_mvp(primary, assessment)}")
+            print(f"首批 20 用户从哪里来：{_first_20_users_source(primary, assessment)}")
+            print(f"不该做大的边界：{_do_not_scale_boundary(primary, assessment)}")
+            print(f"最终结论：{_final_conclusion(primary, assessment)}")
+        print(f"链接：{primary.url}")
     else:
-        print("No Bet Today | 今天没有值得立刻开工的切口")
+        print("今日唯一候选 | 丢弃")
         for opp in dropped[:2]:
             assessment = assessments.get(opp.id)
             print(f"- {opp.title}：{_filtered_reason(opp, assessment)}")
 
-    if watchlist:
-        print("\nKeep Warm：")
-        for idx, opp in enumerate(watchlist, 1):
+    if remaining_watchlist:
+        print("\n继续观察：")
+        for idx, opp in enumerate(remaining_watchlist, 1):
             assessment = assessments.get(opp.id)
             verdict = assessment.verdict if assessment else None
             summary = _phase2_signal_summary(opp, assessment) if assessment else '证据待补充'
             print(f"{idx}. {_decision_label(opp.score, verdict)} | 信号 {_signal_strength_label(opp.score)} | {opp.title}")
             print(f"   {summary}")
-            print(f"   {_filtered_reason(opp, assessment)}")
+            print(f"   {_final_conclusion(opp, assessment)}")
 
-    print("\nPass For Now：")
+    print("\n今天不值得做：")
     if dropped:
-        for idx, opp in enumerate(dropped, 1):
-            assessment = assessments.get(opp.id)
-            verdict = assessment.verdict if assessment else None
-            summary = _phase2_signal_summary(opp, assessment) if assessment else '证据待补充'
-            print(f"{idx}. {_decision_label(opp.score, verdict)} | 信号 {_signal_strength_label(opp.score)} | {opp.title}")
-            print(f"   {summary}")
-            print(f"   {_filtered_reason(opp, assessment)}")
+        for line in _not_worth_doing_lines(dropped, assessments):
+            print(line)
     else:
         print("无更多可列出的过滤样本")
     print()

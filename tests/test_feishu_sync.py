@@ -50,8 +50,42 @@ class FeishuSyncTests(unittest.TestCase):
                     result = main.sync_report_to_feishu()
 
                 self.assertIsNone(result)
-                self.assertIn("Feishu doc sync unavailable: node runtime not found", stdout.getvalue())
+                self.assertIn("Feishu doc sync blocked: node runtime not found", stdout.getvalue())
                 mock_run.assert_not_called()
+        finally:
+            main.FEISHU_DOC_SYNC_ENABLED = old_enabled
+            main.DATA_DIR = old_data_dir
+
+    @patch("main.subprocess.run")
+    @patch("main._resolve_feishu_runtime", return_value=("/opt/homebrew/bin/node", "/tmp/openclaw/node_modules", None))
+    @patch("main._resolve_feishu_credentials", return_value=("cli_valid", "secret_valid"))
+    def test_sync_report_to_feishu_reports_network_blocker(self, _mock_creds, _mock_runtime, mock_run):
+        old_enabled = main.FEISHU_DOC_SYNC_ENABLED
+        old_data_dir = main.DATA_DIR
+        try:
+            main.FEISHU_DOC_SYNC_ENABLED = True
+            with tempfile.TemporaryDirectory() as temp_dir:
+                main.DATA_DIR = temp_dir
+                with open(os.path.join(temp_dir, "latest_phase1.md"), "w", encoding="utf-8") as f:
+                    f.write("# test report\n")
+
+                mock_run.return_value.stdout = """
+[error]: [
+  AxiosError: getaddrinfo ENOTFOUND open.feishu.cn
+]
+{"created":false,"write_ok":false,"index_update_ok":false,"doc_url":"","title":"x","error":"Cannot destructure property 'tenant_access_token' of '(intermediate value)' as it is undefined.","warning":""}
+"""
+                mock_run.return_value.stderr = ""
+                mock_run.return_value.returncode = 1
+
+                with patch("sys.stdout", new=io.StringIO()) as stdout:
+                    result = main.sync_report_to_feishu()
+
+                self.assertIsNone(result)
+                self.assertIn(
+                    "Feishu doc sync blocked: outbound DNS/network access to open.feishu.cn is unavailable in the current environment",
+                    stdout.getvalue(),
+                )
         finally:
             main.FEISHU_DOC_SYNC_ENABLED = old_enabled
             main.DATA_DIR = old_data_dir

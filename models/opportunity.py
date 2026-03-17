@@ -62,10 +62,10 @@ class Opportunity:
         if custom:
             return custom
         mapping = {
-            "A": "立即验证",
-            "B": "保留观察",
-            "C": "暂不投入",
-            "D": "直接过滤",
+            "A": "做 7 天 MVP 验证",
+            "B": "做 landing page 验证",
+            "C": "做 landing page 验证",
+            "D": "丢弃",
         }
         return mapping[self.grade_label()]
     
@@ -114,38 +114,34 @@ class Opportunity:
         }.get(self.source, "💡")
 
         wedge = getattr(self, "phase2_wedge", f"围绕「{self.title}」切一个最窄且可先收钱的工作流")
-        solo_logic = getattr(self, "phase2_solo_logic", self.solo_feasibility or "待分析")
+        target_user = getattr(self, "phase2_target_user", "待分析")
+        trigger_event = getattr(self, "phase2_trigger_event", "待分析")
+        current_alternative = getattr(self, "phase2_current_alternative", "待分析")
+        why_existing_bad = getattr(self, "phase2_why_existing_bad", self.risks or "待分析")
+        why_now = getattr(self, "phase2_why_now", self.summary or "待分析")
+        why_fit = getattr(self, "phase2_why_fit_for_user", self.solo_feasibility or "待分析")
         first_users = getattr(self, "phase2_first_users", self.customer_acquisition or "待分析")
         paid_mvp = getattr(self, "phase2_paid_mvp", self.action_plan or "待分析")
-        risk_logic = getattr(self, "phase2_not_crushed", self.risks or "待分析")
+        boundary = getattr(self, "phase2_boundary", self.risks or "待分析")
+        final_conclusion = getattr(self, "phase2_final_conclusion", self.decision_label())
         
         return f"""
 {emoji} 【一人公司机会 #{self.id}】{self.decision_label()} | 机会信号 {self.signal_strength_label()}
 
-📌 切入 wedge：{wedge}
+📌 切口名称：{wedge}
 🔗 来源：{self.source.upper()} | {self.url}
 
-📖 项目介绍
-{self.description if self.description else self.summary}
-
-👤 一人公司可行性
-{solo_logic}
-
-🤖 需要的 Agent 角色
-{', '.join(self.agent_roles) if self.agent_roles else "待分析"}
-
-💰 启动成本：{self.startup_cost or "待分析"}
-⏱️ 多久见钱：{self.time_to_revenue or "待分析"}
-📈 收入模式：{self.revenue_model or "待分析"}
-🎯 月收入潜力：{self.monthly_potential or "待分析"}
-⚙️ 自动化率：{self.automation_rate or "待分析"}
-📢 前 20 个用户：{first_users}
-
-⚠️ 风险
-{risk_logic}
-
-🚀 第一步
-{paid_mvp}
+👤 目标用户：{target_user}
+⏱️ 高频场景：{trigger_event}
+🔁 当前替代方案：{current_alternative}
+❌ 为什么现有方案不好：{why_existing_bad}
+🕒 为什么现在值得做：{why_now}
+✅ 为什么适合用户：{why_fit}
+💵 6 周最小收费版本：{paid_mvp}
+📢 首批 20 用户从哪里来：{first_users}
+🚦 验证动作：{self.decision_label()}
+🧱 不该做大的边界：{boundary}
+📌 最终结论：{final_conclusion}
 
 {f"🏷️ 标签：{', '.join(self.tags)}" if self.tags else ""}
 ---

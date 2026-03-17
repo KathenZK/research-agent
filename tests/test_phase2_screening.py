@@ -220,17 +220,33 @@ class Phase2ScreeningTests(unittest.TestCase):
             with open(os.path.join(tmpdir, "latest_phase1.md"), "r", encoding="utf-8") as f:
                 report = f.read()
 
-        self.assertIn("## Recommended Bet", report)
-        self.assertIn("## Keep Warm", report)
-        self.assertIn("## Pass For Now", report)
+        self.assertIn("## 今日唯一候选", report)
+        self.assertIn("- 切口名称:", report)
+        self.assertIn("- 目标用户:", report)
+        self.assertIn("- 高频场景:", report)
+        self.assertIn("- 当前替代方案:", report)
+        self.assertIn("- 为什么现有方案不好:", report)
+        self.assertIn("- 为什么现在值得做:", report)
+        self.assertIn("- 为什么适合用户:", report)
+        self.assertIn("- 6 周最小收费版本:", report)
+        self.assertIn("- 首批 20 用户从哪里来:", report)
+        self.assertIn("- 验证动作（landing page / 7 day MVP / 丢弃）:", report)
+        self.assertIn("- 不该做大的边界:", report)
+        self.assertIn("- 最终结论:", report)
+        self.assertIn("## 继续观察", report)
+        self.assertIn("## 今天不值得做", report)
         self.assertIn("- 机会信号:", report)
         self.assertIn("- 证据摘要:", report)
+        self.assertIn("做 7 天 MVP 验证", report)
+        self.assertIn("做 landing page 验证", report)
+        self.assertIn("丢弃", report)
         self.assertNotIn("/100", report)
         self.assertNotIn("筛选分", report)
-        self.assertNotIn("## Watchlist", report)
-        self.assertNotIn("## Not Worth Doing Now", report)
+        self.assertNotIn("## Recommended Bet", report)
+        self.assertNotIn("## Keep Warm", report)
+        self.assertNotIn("## Pass For Now", report)
 
-    def test_top0_report_uses_no_bet_wording(self):
+    def test_top0_report_uses_drop_wording(self):
         _, _, drop = self._make_keep_watch_drop_triplet()
         assessments = {drop.id: _build_phase2_assessment(drop)}
 
@@ -241,14 +257,19 @@ class Phase2ScreeningTests(unittest.TestCase):
             with open(os.path.join(tmpdir, "latest_phase1.md"), "r", encoding="utf-8") as f:
                 report = f.read()
 
-        self.assertIn("## No Bet Today", report)
+        self.assertIn("## 今日唯一候选", report)
         self.assertNotIn("## Top0", report)
-        self.assertIn("今天没有出现值得 founder 立刻投入验证周期的切口。", report)
+        self.assertIn("**丢弃**", report)
+        self.assertIn("今天没有出现值得继续验证的唯一候选。", report)
 
     def test_top10_report_uses_signal_labels_instead_of_scores(self):
         keep, _, _ = self._make_keep_watch_drop_triplet()
         keep.phase2_adjusted_score = _build_phase2_assessment(keep).adjusted_score
-        keep.phase2_decision_label = "立即验证"
+        keep.phase2_decision_label = "做 7 天 MVP 验证"
+        keep.phase2_target_user = "月销 5-50 万美元的 Shopify 商家运营负责人"
+        keep.phase2_trigger_event = "出现退款争议、退款滥用或高风险订单时"
+        keep.phase2_paid_mvp = "先卖每周一次的退款滥用审计报告试点。"
+        keep.phase2_final_conclusion = "做 7 天 MVP 验证。先把退款滥用审计报告卖给近期正在处理退款争议的商家。"
 
         with tempfile.TemporaryDirectory() as tmpdir:
             with patch("main.DATA_DIR", tmpdir):
@@ -258,7 +279,7 @@ class Phase2ScreeningTests(unittest.TestCase):
                 report = f.read()
 
         self.assertIn("- 机会信号:", report)
-        self.assertIn("- 建议动作:", report)
+        self.assertIn("- 验证动作（landing page / 7 day MVP / 丢弃）:", report)
         self.assertNotIn("/100", report)
 
 

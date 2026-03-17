@@ -70,16 +70,16 @@ class ReportVerificationTests(unittest.TestCase):
 
             with open(latest_report, "r", encoding="utf-8") as fh:
                 report = fh.read()
-            self.assertIn("- 结论: 今日没有值得立刻开工的切口", report)
+            self.assertIn("- 结论: 丢弃。今日没有值得继续验证的切口。", report)
             self.assertIn("## Run Notes", report)
-            self.assertIn("## No Bet Today", report)
+            self.assertIn("## 今日唯一候选", report)
             self.assertIn(reason, report)
 
             console = stdout.getvalue()
-            self.assertIn("No Bet Today | 今天没有值得立刻开工的切口", console)
+            self.assertIn("今日唯一候选 | 丢弃", console)
             self.assertIn("No kept candidate to send via direct Feishu message", console)
 
-    def test_save_phase1_report_keeps_watchlist_in_top0_report(self):
+    def test_save_phase1_report_promotes_watch_to_unique_candidate(self):
         opportunities = [_watch_opportunity("watch-1"), _drop_opportunity("drop-1")]
         assessments = {opp.id: _build_phase2_assessment(opp) for opp in opportunities}
 
@@ -92,11 +92,30 @@ class ReportVerificationTests(unittest.TestCase):
 
             with open(latest_report, "r", encoding="utf-8") as fh:
                 report = fh.read()
-            self.assertIn("- 结论: 今日没有值得立刻开工的切口", report)
-            self.assertIn("## Keep Warm", report)
-            self.assertIn("AI playbook setup for engineering teams watch-1", report)
-            self.assertIn("## Pass For Now", report)
-            self.assertIn("Planning - $10K MRR project management tool drop-1", report)
+            self.assertIn("- 结论: 做 landing page 验证。", report)
+            self.assertIn("## 今日唯一候选", report)
+            self.assertIn("- 切口名称: AI 编程评审清单与代码库 playbook 试点", report)
+            self.assertIn("- 验证动作（landing page / 7 day MVP / 丢弃）: **做 landing page 验证**", report)
+            self.assertIn("## 今天不值得做", report)
+            self.assertIn("- 项目管理型机会:", report)
+
+    def test_today_not_worth_doing_section_outputs_three_to_five_concise_judgments(self):
+        drops = [_drop_opportunity(f"drop-{idx}") for idx in range(1, 5)]
+        assessments = {opp.id: _build_phase2_assessment(opp) for opp in drops}
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "DATA_DIR", tmpdir):
+            with redirect_stdout(io.StringIO()):
+                main.save_phase1_report(drops, assessments)
+
+            with open(os.path.join(tmpdir, "latest_phase1.md"), "r", encoding="utf-8") as fh:
+                report = fh.read()
+
+        self.assertIn("## 今天不值得做", report)
+        section = report.split("## 今天不值得做", 1)[1]
+        bullet_lines = [line for line in section.splitlines() if line.startswith("- 项目管理型机会:")]
+        self.assertEqual(len(bullet_lines), 4)
+        for line in bullet_lines:
+            self.assertIn("主战场", line)
 
     def test_sync_report_to_feishu_redacts_subprocess_failure_output(self):
         with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "DATA_DIR", tmpdir), patch.object(
