@@ -33,6 +33,7 @@ from collectors import (
     AgentReachBridge, AppStoreReviewsCollector, ChineseMediaCollector,
     GitHubIssuesCollector, GitHubTrendingCollector, HNCollector, PHCollector,
     RedditPainCollector, SaaSReviewsCollector,
+    V2EXCollector, ZhihuCollector, SspaiCollector,
 )
 from collectors.reddit import RedditCollector
 from analyzers import BailianAnalyzer
@@ -81,6 +82,7 @@ def collect_data(
     enable_github_pain_issues=True, github_pain_limit=15,
     reddit_pain_limit=15,
     enable_saas_reviews=True, saas_review_limit=12,
+    v2ex_limit=15, zhihu_limit=15, sspai_limit=10,
 ) -> List[dict]:
     """收集数据 -- 按信号质量分组采集"""
     import logging
@@ -102,6 +104,16 @@ def collect_data(
     if enable_saas_reviews:
         logger.info(f"Fetching SaaS review complaints (limit={saas_review_limit})...")
         items.extend(SaaSReviewsCollector().fetch(limit=saas_review_limit))
+
+    # --- Chinese pain-point sources ---
+    logger.info(f"Fetching V2EX pain signals (limit={v2ex_limit})...")
+    items.extend(V2EXCollector().fetch(limit=v2ex_limit))
+
+    logger.info(f"Fetching Zhihu pain signals (limit={zhihu_limit})...")
+    items.extend(ZhihuCollector().fetch(limit=zhihu_limit))
+
+    logger.info(f"Fetching Sspai articles (limit={sspai_limit})...")
+    items.extend(SspaiCollector().fetch(limit=sspai_limit))
 
     # --- Discussion sources ---
     logger.info(f"Fetching GitHub Trending (limit={github_limit})...")
@@ -455,6 +467,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--reddit-pain-limit', type=int, default=15)
     parser.add_argument('--disable-saas-reviews', action='store_true', help='禁用 SaaS 评论差评采集（默认开启）')
     parser.add_argument('--saas-review-limit', type=int, default=12)
+    parser.add_argument('--v2ex-limit', type=int, default=15, help='V2EX 痛点帖采集数量（默认 15）')
+    parser.add_argument('--zhihu-limit', type=int, default=15, help='知乎痛点采集数量（默认 15）')
+    parser.add_argument('--sspai-limit', type=int, default=10, help='少数派文章采集数量（默认 10）')
     parser.add_argument('--indie-mode', action='store_true', help='一人公司模式：痛点源翻倍、热度源减半、降低 keep 阈值、自动生成 Landing Page')
     parser.add_argument('--enable-github-issues', action='store_true')
     parser.add_argument('--enable-mvp-generation', action='store_true')
@@ -506,6 +521,9 @@ def main():
         args.github_pain_limit = max(args.github_pain_limit, 20)
         args.reddit_pain_limit = max(args.reddit_pain_limit, 20)
         args.saas_review_limit = max(args.saas_review_limit, 16)
+        args.v2ex_limit = max(args.v2ex_limit, 20)
+        args.zhihu_limit = max(args.zhihu_limit, 20)
+        args.sspai_limit = max(args.sspai_limit, 12)
         args.hn_limit = min(args.hn_limit, 15)
         args.ph_limit = min(args.ph_limit, 10)
         args.min_score = min(args.min_score, 55)
@@ -528,6 +546,9 @@ def main():
             reddit_pain_limit=min(4, args.reddit_pain_limit),
             enable_saas_reviews=not args.disable_saas_reviews,
             saas_review_limit=min(4, args.saas_review_limit),
+            v2ex_limit=min(4, args.v2ex_limit),
+            zhihu_limit=min(4, args.zhihu_limit),
+            sspai_limit=min(3, args.sspai_limit),
         )
         print(f"Collected {len(items)} items")
         for item in items[:3]:
@@ -546,6 +567,9 @@ def main():
         reddit_pain_limit=args.reddit_pain_limit,
         enable_saas_reviews=not args.disable_saas_reviews,
         saas_review_limit=args.saas_review_limit,
+        v2ex_limit=args.v2ex_limit,
+        zhihu_limit=args.zhihu_limit,
+        sspai_limit=args.sspai_limit,
     )
     opportunities = asyncio.run(analyze_items_async(items, min_score=args.min_score))
 
