@@ -32,6 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from mvp_generator import MVPGenerator
 from config import DEBUG, DATA_DIR, LOG_DIR, BAILIAN_API_KEY, FEISHU_APP_ID, FEISHU_APP_SECRET, FEISHU_USER_ID, FEISHU_INDEX_DOC_TOKEN, FEISHU_DOC_SYNC_ENABLED, validate_config, GITHUB_TOKEN, GITHUB_REPO
+from enrichers import WebEnricher
 from collectors import (
     AgentReachBridge,
     AppStoreReviewsCollector,
@@ -40,6 +41,8 @@ from collectors import (
     GitHubTrendingCollector,
     HNCollector,
     PHCollector,
+    RedditPainCollector,
+    SaaSReviewsCollector,
 )
 from collectors.indiehackers import IndieHackersCollector
 from collectors.reddit import RedditCollector
@@ -54,6 +57,33 @@ PHASE2_WATCH_MIN_SCORE = 72
 FINAL_ACTION_LANDING_PAGE = '做 landing page 验证'
 FINAL_ACTION_7DAY_MVP = '做 7 天 MVP 验证'
 FINAL_ACTION_DROP = '丢弃'
+
+SOURCE_QUALITY: Dict[str, str] = {
+    'appstore_reviews': 'pain',
+    'github_issues': 'pain',
+    'reddit_pain': 'pain',
+    'saas_reviews': 'pain',
+    'reddit': 'discussion',
+    'reddit_r/saas': 'discussion',
+    'reddit_r/entrepreneur': 'discussion',
+    'github': 'discussion',
+    'github_trending': 'discussion',
+    'x': 'discussion',
+    'hn': 'hype',
+    'ph': 'hype',
+    'indiehackers': 'story',
+    '36kr': 'news',
+    'huxiu': 'news',
+    'tiehan': 'news',
+}
+
+SOURCE_QUALITY_SCORE: Dict[str, int] = {
+    'pain': 5,
+    'discussion': 2,
+    'hype': -3,
+    'story': -5,
+    'news': -4,
+}
 
 
 @dataclass
@@ -98,47 +128,17 @@ def setup_logging():
 def collect_data(hn_limit: int = 10, ph_limit: int = 5, media_hours: int = 48,
                  indie_limit: int = 15, reddit_limit: int = 10, github_limit: int = 10,
                  enable_agent_reach: bool = False, ar_limit: int = 10,
-                 enable_app_store_reviews: bool = False, app_store_review_limit: int = 8,
-                 enable_github_pain_issues: bool = False, github_pain_limit: int = 8) -> List[dict]:
+                 enable_app_store_reviews: bool = True, app_store_review_limit: int = 15,
+                 enable_github_pain_issues: bool = True, github_pain_limit: int = 15,
+                 reddit_pain_limit: int = 15,
+                 enable_saas_reviews: bool = True, saas_review_limit: int = 12) -> List[dict]:
     """收集数据"""
     import logging
     logger = logging.getLogger(__name__)
     
     items = []
     
-    # Hacker News
-    logger.info(f"Fetching HN (limit={hn_limit})...")
-    hn_items = HNCollector.fetch(limit=hn_limit)
-    logger.info(f"Got {len(hn_items)} HN items")
-    items.extend(hn_items)
-    
-    # Product Hunt
-    logger.info(f"Fetching PH (limit={ph_limit})...")
-    ph_items = PHCollector.fetch(limit=ph_limit)
-    logger.info(f"Got {len(ph_items)} PH items")
-    items.extend(ph_items)
-    
-    
-    # Chinese Media (36Kr, Huxiu, etc.)
-    logger.info(f"Fetching Chinese Media (hours={media_hours})...")
-    media_items = ChineseMediaCollector.fetch(hours=media_hours, limit=20)
-    logger.info(f"Got {len(media_items)} Chinese media items")
-    items.extend(media_items)
-    
-    
-    # IndieHackers (solo founder stories)
-    logger.info(f"Fetching IndieHackers (limit={indie_limit})...")
-    ih_collector = IndieHackersCollector()
-    ih_items = ih_collector.fetch(limit=indie_limit)
-    logger.info(f"Got {len(ih_items)} IndieHackers items")
-    items.extend(ih_items)
-
-    # GitHub Trending
-    logger.info(f"Fetching GitHub Trending (limit={github_limit})...")
-    gh_collector = GitHubTrendingCollector()
-    gh_items = gh_collector.fetch(limit=github_limit)
-    logger.info(f"Got {len(gh_items)} GitHub Trending items")
-    items.extend(gh_items)
+    # --- Pain-point sources (highest signal quality) ---
 
     if enable_app_store_reviews:
         logger.info(f"Fetching App Store reviews (limit={app_store_review_limit})...")
@@ -154,6 +154,28 @@ def collect_data(hn_limit: int = 10, ph_limit: int = 5, media_hours: int = 48,
         logger.info(f"Got {len(github_issue_items)} GitHub issue pain items")
         items.extend(github_issue_items)
 
+    logger.info(f"Fetching Reddit pain signals (limit={reddit_pain_limit})...")
+    reddit_pain_collector = RedditPainCollector()
+    reddit_pain_items = reddit_pain_collector.fetch(limit=reddit_pain_limit)
+    logger.info(f"Got {len(reddit_pain_items)} Reddit pain items")
+    items.extend(reddit_pain_items)
+
+    if enable_saas_reviews:
+        logger.info(f"Fetching SaaS review complaints (limit={saas_review_limit})...")
+        saas_collector = SaaSReviewsCollector()
+        saas_items = saas_collector.fetch(limit=saas_review_limit)
+        logger.info(f"Got {len(saas_items)} SaaS review items")
+        items.extend(saas_items)
+
+    # --- Discussion sources ---
+
+    # GitHub Trending
+    logger.info(f"Fetching GitHub Trending (limit={github_limit})...")
+    gh_collector = GitHubTrendingCollector()
+    gh_items = gh_collector.fetch(limit=github_limit)
+    logger.info(f"Got {len(gh_items)} GitHub Trending items")
+    items.extend(gh_items)
+
     # fallback legacy Reddit collector (kept for compatibility)
     if not enable_agent_reach:
         logger.info(f"Fetching Reddit (limit={reddit_limit})...")
@@ -162,6 +184,32 @@ def collect_data(hn_limit: int = 10, ph_limit: int = 5, media_hours: int = 48,
         logger.info(f"Got {len(reddit_items)} Reddit items")
         items.extend(reddit_items)
 
+    # --- Hype / news sources ---
+
+    # Hacker News
+    logger.info(f"Fetching HN (limit={hn_limit})...")
+    hn_items = HNCollector.fetch(limit=hn_limit)
+    logger.info(f"Got {len(hn_items)} HN items")
+    items.extend(hn_items)
+    
+    # Product Hunt
+    logger.info(f"Fetching PH (limit={ph_limit})...")
+    ph_items = PHCollector.fetch(limit=ph_limit)
+    logger.info(f"Got {len(ph_items)} PH items")
+    items.extend(ph_items)
+    
+    # Chinese Media (36Kr, Huxiu, etc.)
+    logger.info(f"Fetching Chinese Media (hours={media_hours})...")
+    media_items = ChineseMediaCollector.fetch(hours=media_hours, limit=20)
+    logger.info(f"Got {len(media_items)} Chinese media items")
+    items.extend(media_items)
+    
+    # IndieHackers (solo founder stories)
+    logger.info(f"Fetching IndieHackers (limit={indie_limit})...")
+    ih_collector = IndieHackersCollector()
+    ih_items = ih_collector.fetch(limit=indie_limit)
+    logger.info(f"Got {len(ih_items)} IndieHackers items")
+    items.extend(ih_items)
 
     # Agent Reach bridge (P1: X / YouTube / Reddit)
     if enable_agent_reach:
@@ -199,20 +247,43 @@ def analyze_items(items: List[dict], min_score: int = 60) -> List[Opportunity]:
 
 
 async def analyze_items_async(items: List[dict], min_score: int = 60) -> List[Opportunity]:
-    """异步分析项目"""
+    """异步分析项目（含 enrichment 注入）"""
     import logging
     logger = logging.getLogger(__name__)
-    
+
     if not BAILIAN_API_KEY:
         logger.error("BAILIAN_API_KEY not configured")
         return []
-    
+
+    for item in items:
+        source = (item.get('source') or '').lower()
+        item['source_quality'] = SOURCE_QUALITY.get(source, 'hype')
+
+    logger.info(f"Running web enrichment for {len(items)} items...")
+    enricher = WebEnricher()
+    try:
+        enrichment_map = await enricher.batch_enrich_async(items)
+        logger.info(f"Enrichment completed: {len(enrichment_map)} results")
+    except Exception as e:
+        logger.warning(f"Enrichment failed (continuing without): {e}")
+        enrichment_map = {}
+
     analyzer = BailianAnalyzer()
-    
     logger.info(f"Analyzing {len(items)} items (min_score={min_score})...")
-    opportunities = await analyzer.batch_analyze_async(items, min_score=min_score)
+    opportunities = await analyzer.batch_analyze_async(
+        items, min_score=min_score, enrichment_map=enrichment_map,
+    )
+
+    for opp in opportunities:
+        item_id = str(opp.id)
+        if item_id in enrichment_map:
+            enrichment = enrichment_map[item_id]
+            opp.enrichment_evidence_score = enrichment.evidence_score
+            opp.enrichment_competitor_count = enrichment.competitor_count
+            opp.enrichment_pain_post_count = enrichment.pain_post_count
+            opp.enrichment_summary = enrichment.enrichment_summary
+
     logger.info(f"Found {len(opportunities)} opportunities")
-    
     return opportunities
 
 
@@ -330,6 +401,46 @@ def deduplicate_opportunities(opportunities: List[Opportunity]) -> List[Opportun
         if old is None or opp.score > old.score:
             best[key] = opp
     return list(best.values())
+
+
+def _cross_source_correlation(opportunities: List[Opportunity]) -> None:
+    """Find pain themes appearing across multiple independent source types and boost them.
+
+    Mutates opportunities in-place by setting opp.cross_source_boost.
+    """
+    theme_buckets: Dict[str, Dict[str, Any]] = {}
+
+    for opp in opportunities:
+        tags = [t.lower() for t in (opp.tags or [])]
+        title_words = set(_normalize_title(opp.title).split())
+        theme_keys = set(tags) | {w for w in title_words if len(w) > 3}
+
+        source_type = SOURCE_QUALITY.get((opp.source or '').lower(), 'hype')
+        for key in theme_keys:
+            if not key or len(key) < 3:
+                continue
+            bucket = theme_buckets.setdefault(key, {
+                'source_types': set(),
+                'opp_ids': [],
+            })
+            bucket['source_types'].add(source_type)
+            bucket['opp_ids'].append(opp.id)
+
+    opp_boosts: Dict[str, int] = defaultdict(int)
+    for key, bucket in theme_buckets.items():
+        unique_types = len(bucket['source_types'])
+        if unique_types >= 3:
+            boost = 8
+        elif unique_types >= 2:
+            boost = 5
+        else:
+            continue
+        for opp_id in bucket['opp_ids']:
+            opp_boosts[opp_id] = max(opp_boosts[opp_id], boost)
+
+    for opp in opportunities:
+        boost = opp_boosts.get(opp.id, 0)
+        opp.cross_source_boost = boost
 
 
 def rerank_for_solo(opportunities: List[Opportunity], assessments: Optional[dict] = None) -> List[Opportunity]:
@@ -702,6 +813,8 @@ def _default_first_users_source(opp: Opportunity, assessment: Optional[Screening
         'ph': '从 Product Hunt 发布页评论者、投票用户和同类产品的早期支持者里找首批试用者。',
         'reddit': '从对应 subreddit 的发帖者、评论者和求推荐帖子里私信约访。',
         'reddit_r/saas': '从 r/SaaS 的发帖者、评论者和求工具帖里私信约访。',
+        'reddit_pain': '从 Reddit 痛点帖子的发帖者、评论者和同类抱怨帖里直接约访，这些人已经表达了明确不满。',
+        'saas_reviews': '从差评用户、竞品差评区和同类不满评论者里定向触达，这些人已经在为类似方案付费。',
         'appstore_reviews': '从对应 App 的差评用户、竞品差评区和评论里提到的替代方案用户中定向约访。',
         'github': '从相关仓库的 issue、discussion、star 用户和 README 反馈里找早期用户。',
         'github_trending': '从相关仓库的 issue、discussion、star 用户和 README 反馈里找早期用户。',
@@ -802,19 +915,25 @@ def _build_phase2_assessment(opp: Opportunity) -> ScreeningAssessment:
         adjusted_score -= 8
 
     source = (opp.source or '').lower()
-    if source.startswith('reddit') or source in {'github', 'github_trending', 'github_issues', 'x', 'appstore_reviews'}:
+    source_quality = SOURCE_QUALITY.get(source, 'hype')
+    source_delta = SOURCE_QUALITY_SCORE.get(source_quality, 0)
+    adjusted_score += source_delta
+    if source_quality == 'pain':
+        evidence_score += 2
+        strengths.append(f'{opp.source} 是真实用户痛点信号源')
+    elif source_quality == 'discussion':
         evidence_score += 1
-        adjusted_score += 2
         strengths.append(f'{opp.source} 更接近真实需求现场')
-    elif source == 'indiehackers' and re.search(r'\$\d|mrr', (opp.title or '').lower()):
-        keep_gaps.append('这是成功案例信号，不是未满足需求本身')
-        adjusted_score -= 8
-    elif source == 'hn' and any(term in text_lower for term in ['how i', 'show hn', 'essay']):
-        keep_gaps.append('这是经验分享/展示，不是用户催着付钱的强需求信号')
-        adjusted_score -= 7
-    elif source in {'36kr', 'huxiu', 'tiehan'}:
-        keep_gaps.append('媒体报道更像行业观察，不足以直接证明首单需求')
-        adjusted_score -= 6
+    elif source_quality == 'story':
+        if re.search(r'\$\d|mrr', (opp.title or '').lower()):
+            keep_gaps.append('这是成功案例信号，不是未满足需求本身')
+            adjusted_score -= 3
+    elif source_quality in ('hype', 'news'):
+        if source == 'hn' and any(term in text_lower for term in ['how i', 'show hn', 'essay']):
+            keep_gaps.append('这是经验分享/展示，不是用户催着付钱的强需求信号')
+            adjusted_score -= 4
+        elif source_quality == 'news':
+            keep_gaps.append('媒体报道更像行业观察，不足以直接证明首单需求')
 
     if profile and profile.get('crowded'):
         crowded_hits.append(profile['category_label'])
@@ -853,6 +972,37 @@ def _build_phase2_assessment(opp: Opportunity) -> ScreeningAssessment:
     if any(token in text_lower for token in ['all-in-one', '平台', 'suite', 'workspace', '系统']) and not profile:
         adjusted_score -= 8
         keep_gaps.append('叙述里还是平台/全家桶语言，没有压缩到单结果交付')
+
+    enrichment_evidence = getattr(opp, 'enrichment_evidence_score', 0) or 0
+    enrichment_competitors = getattr(opp, 'enrichment_competitor_count', 0) or 0
+    enrichment_pain_posts = getattr(opp, 'enrichment_pain_post_count', 0) or 0
+    if enrichment_evidence > 0:
+        adjusted_score += enrichment_evidence
+        evidence_score += min(3, enrichment_evidence // 2)
+    if enrichment_pain_posts >= 5:
+        strengths.append(f'Reddit 上有 {enrichment_pain_posts} 条相关痛点帖，需求信号较强')
+    elif enrichment_pain_posts >= 2:
+        strengths.append(f'Reddit 上有 {enrichment_pain_posts} 条相关痛点帖')
+    if enrichment_competitors == 0:
+        strengths.append('暂未发现直接竞品')
+    elif enrichment_competitors >= 8:
+        keep_gaps.append(f'搜索到 {enrichment_competitors} 个竞品/替代方案，市场已经较拥挤')
+        adjusted_score -= 3
+
+    cross_source_boost = getattr(opp, 'cross_source_boost', 0) or 0
+    if cross_source_boost > 0:
+        adjusted_score += cross_source_boost
+        evidence_score += min(2, cross_source_boost // 4)
+        strengths.append(f'同一痛点在多个独立数据源出现（跨源加分 +{cross_source_boost}）')
+
+    feedback_boost = getattr(opp, 'feedback_boost', 0) or 0
+    if feedback_boost > 0:
+        adjusted_score += feedback_boost
+        evidence_score += 2
+        strengths.append('历史反馈中同类痛点已被验证可行')
+    elif feedback_boost < 0:
+        adjusted_score += feedback_boost
+        keep_gaps.append('历史反馈中同类痛点验证失败过')
 
     fast_payback = _is_fast_payback_window(opp.time_to_revenue)
     generic_action_plan = _is_generic_action_plan(opp.action_plan)
@@ -2593,6 +2743,129 @@ def print_results(opportunities: List[Opportunity]):
         print("-"*80 + "\n")
 
 
+FEEDBACK_FILE = os.path.join(DATA_DIR, 'feedback.json')
+
+
+def _load_feedback() -> Dict[str, Any]:
+    if not os.path.exists(FEEDBACK_FILE):
+        return {}
+    try:
+        with open(FEEDBACK_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_feedback(data: Dict[str, Any]) -> None:
+    with open(FEEDBACK_FILE, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _apply_feedback_boosts(opportunities: List[Opportunity]) -> None:
+    """Apply score adjustments based on historical feedback on similar pain themes."""
+    feedback = _load_feedback()
+    if not feedback:
+        return
+
+    validated_themes: set[str] = set()
+    failed_themes: set[str] = set()
+    for fp, entry in feedback.items():
+        tags = entry.get('tags', [])
+        outcome = entry.get('outcome', '')
+        for tag in tags:
+            tag_lower = tag.lower()
+            if outcome == 'validated':
+                validated_themes.add(tag_lower)
+            elif outcome == 'failed':
+                failed_themes.add(tag_lower)
+
+    for opp in opportunities:
+        opp_tags = {t.lower() for t in (opp.tags or [])}
+        if opp_tags & validated_themes:
+            opp.feedback_boost = 10
+        elif opp_tags & failed_themes:
+            opp.feedback_boost = -5
+        else:
+            opp.feedback_boost = 0
+
+
+def run_feedback_cli() -> None:
+    """Interactive CLI for recording feedback on recent kept/watch opportunities."""
+    latest_file = os.path.join(DATA_DIR, 'latest.json')
+    if not os.path.exists(latest_file):
+        print("No latest.json found. Run the agent first to generate opportunities.")
+        return
+
+    try:
+        with open(latest_file, 'r', encoding='utf-8') as f:
+            raw = json.load(f)
+    except Exception as e:
+        print(f"Error reading latest.json: {e}")
+        return
+
+    candidates = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        verdict = item.get('phase2_verdict', '')
+        if verdict in ('keep', 'watch'):
+            candidates.append(item)
+
+    if not candidates:
+        print("No kept/watch opportunities found in latest run.")
+        return
+
+    feedback = _load_feedback()
+    print(f"\n{'='*60}")
+    print(f"Feedback for {len(candidates)} recent opportunities")
+    print(f"{'='*60}\n")
+
+    for idx, item in enumerate(candidates, 1):
+        title = item.get('title', 'Unknown')[:60]
+        verdict = item.get('phase2_verdict', '?')
+        fp = _fingerprint_opportunity(_restore_opportunity_from_dict(item))
+
+        existing = feedback.get(fp)
+        if existing:
+            print(f"  #{idx} {title} [{verdict}] -- already has feedback: {existing.get('action', '?')} / {existing.get('outcome', '?')}")
+            continue
+
+        print(f"\n  #{idx} {title} [{verdict}]")
+        print(f"      {item.get('description', '')[:120]}")
+        print()
+        print("  Action? (p)ursued / (s)kipped / (i)rrelevant / Enter to skip:")
+        action_input = input("  > ").strip().lower()
+        if not action_input:
+            continue
+
+        action_map = {'p': 'pursued', 's': 'skipped', 'i': 'irrelevant'}
+        action = action_map.get(action_input[0], '')
+        if not action:
+            continue
+
+        outcome = ''
+        if action == 'pursued':
+            print("  Outcome? (v)alidated / (f)ailed / (o)ngoing / Enter to skip:")
+            outcome_input = input("  > ").strip().lower()
+            outcome_map = {'v': 'validated', 'f': 'failed', 'o': 'ongoing'}
+            outcome = outcome_map.get(outcome_input[0] if outcome_input else '', '')
+
+        print("  Notes (optional, Enter to skip):")
+        notes = input("  > ").strip()
+
+        feedback[fp] = {
+            'title': item.get('title', ''),
+            'action': action,
+            'outcome': outcome,
+            'notes': notes,
+            'tags': item.get('tags', []),
+            'rated_at': datetime.now().isoformat(),
+        }
+
+    _save_feedback(feedback)
+    print(f"\nFeedback saved to {FEEDBACK_FILE} ({len(feedback)} entries total)")
+
+
 def _finalize_top0_run(reason: str):
     rule_adjustment = _daily_rule_adjustment([], {})
     save_phase1_report([], {}, run_notes=[reason])
@@ -2611,6 +2884,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--debug', action='store_true', help='调试模式')
     parser.add_argument('--weekly-report', action='store_true', help='基于历史快照生成深筛周报')
     parser.add_argument('--weekly-days', type=int, default=7, help='深筛周报回看天数（默认 7）')
+    parser.add_argument('--feedback', action='store_true', help='录入对近期机会的反馈（pursued/skipped/validated/failed）')
     parser.add_argument('--hn-limit', type=int, default=30, help='HN 获取数量')
     parser.add_argument('--ph-limit', type=int, default=20, help='PH 获取数量')
     parser.add_argument('--min-score', type=int, default=60, help='最低分数')
@@ -2620,10 +2894,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--github-limit', type=int, default=10, help='GitHub Trending 获取数量')
     parser.add_argument('--enable-agent-reach', action='store_true', help='启用 Agent Reach 桥接采集（X/YouTube/Reddit）')
     parser.add_argument('--ar-limit', type=int, default=10, help='Agent Reach 每平台抓取数量')
-    parser.add_argument('--enable-app-store-reviews', action='store_true', help='启用 App Store 差评采集（默认关闭）')
-    parser.add_argument('--app-store-review-limit', type=int, default=8, help='App Store 差评采集数量（默认 8）')
-    parser.add_argument('--enable-github-pain-issues', action='store_true', help='启用 GitHub issue 痛点采集（默认关闭）')
-    parser.add_argument('--github-pain-limit', type=int, default=8, help='GitHub issue 痛点采集数量（默认 8）')
+    parser.add_argument('--disable-app-store-reviews', action='store_true', help='禁用 App Store 差评采集（默认开启）')
+    parser.add_argument('--app-store-review-limit', type=int, default=15, help='App Store 差评采集数量（默认 15）')
+    parser.add_argument('--disable-github-pain-issues', action='store_true', help='禁用 GitHub issue 痛点采集（默认开启）')
+    parser.add_argument('--github-pain-limit', type=int, default=15, help='GitHub issue 痛点采集数量（默认 15）')
+    parser.add_argument('--reddit-pain-limit', type=int, default=15, help='Reddit 痛点搜索采集数量（默认 15）')
+    parser.add_argument('--disable-saas-reviews', action='store_true', help='禁用 SaaS 评论差评采集（默认开启）')
+    parser.add_argument('--saas-review-limit', type=int, default=12, help='SaaS 评论差评采集数量（默认 12）')
     parser.add_argument('--indie-mode', action='store_true', help='一人公司模式：专注 Indie Hacker/微 SaaS/自动化机会')
     parser.add_argument('--enable-github-issues', action='store_true', help='显式启用 GitHub issue 创建（默认关闭）')
     parser.add_argument('--enable-mvp-generation', action='store_true', help='显式启用 MVP 自动生成（默认关闭）')
@@ -2645,6 +2922,10 @@ def main():
     # 设置日志
     logger = setup_logging()
     logger.info("Starting research agent...")
+
+    if args.feedback:
+        run_feedback_cli()
+        return
 
     if args.weekly_report:
         report_file = save_weekly_report(window_days=max(1, args.weekly_days))
@@ -2680,10 +2961,13 @@ def main():
             github_limit=min(4, args.github_limit),
             enable_agent_reach=args.enable_agent_reach,
             ar_limit=min(5, args.ar_limit),
-            enable_app_store_reviews=args.enable_app_store_reviews,
+            enable_app_store_reviews=not args.disable_app_store_reviews,
             app_store_review_limit=min(4, args.app_store_review_limit),
-            enable_github_pain_issues=args.enable_github_pain_issues,
+            enable_github_pain_issues=not args.disable_github_pain_issues,
             github_pain_limit=min(4, args.github_pain_limit),
+            reddit_pain_limit=min(4, args.reddit_pain_limit),
+            enable_saas_reviews=not args.disable_saas_reviews,
+            saas_review_limit=min(4, args.saas_review_limit),
         )
         print(f"Collected {len(items)} items")
         for item in items[:3]:
@@ -2700,10 +2984,13 @@ def main():
         github_limit=args.github_limit,
         enable_agent_reach=args.enable_agent_reach,
         ar_limit=args.ar_limit,
-        enable_app_store_reviews=args.enable_app_store_reviews,
+        enable_app_store_reviews=not args.disable_app_store_reviews,
         app_store_review_limit=args.app_store_review_limit,
-        enable_github_pain_issues=args.enable_github_pain_issues,
+        enable_github_pain_issues=not args.disable_github_pain_issues,
         github_pain_limit=args.github_pain_limit,
+        reddit_pain_limit=args.reddit_pain_limit,
+        enable_saas_reviews=not args.disable_saas_reviews,
+        saas_review_limit=args.saas_review_limit,
     )
     opportunities = asyncio.run(analyze_items_async(items, min_score=args.min_score))
 
@@ -2717,6 +3004,8 @@ def main():
             _finalize_top0_run("本次命中的机会与近 14 天重复，未产生新的 Top1/Watchlist。")
             return
 
+        _cross_source_correlation(opportunities)
+        _apply_feedback_boosts(opportunities)
         assessments = _annotate_phase2_assessments(opportunities)
         opportunities = rerank_for_solo(opportunities, assessments)
         kept_candidates, watch_candidates, dropped_candidates = _bucket_phase2_candidates(opportunities, assessments)

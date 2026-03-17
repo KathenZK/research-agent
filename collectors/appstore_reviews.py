@@ -17,6 +17,9 @@ class AppStoreReviewsCollector:
     GENRES = [
         ("business", "6000"),
         ("productivity", "6007"),
+        ("developer-tools", "6026"),
+        ("finance", "6015"),
+        ("health-fitness", "6013"),
     ]
 
     def __init__(self, storefront: str = "us"):
