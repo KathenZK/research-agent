@@ -147,6 +147,23 @@ class ReportVerificationTests(unittest.TestCase):
             self.assertNotIn("cli_secret", console)
             self.assertNotIn("top_secret", console)
 
+    def test_top0_report_still_outputs_three_not_worth_doing_bullets(self):
+        reason = "本次命中的机会与近 14 天重复，未产生新的 Top1/Watchlist。"
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(main, "DATA_DIR", tmpdir), patch.object(
+            main, "sync_report_to_feishu", return_value=None
+        ):
+            with redirect_stdout(io.StringIO()):
+                main._finalize_top0_run(reason)
+
+            with open(os.path.join(tmpdir, "latest_phase1.md"), "r", encoding="utf-8") as fh:
+                report = fh.read()
+
+        section = report.split("## 今天不值得做", 1)[1]
+        bullet_lines = [line for line in section.splitlines() if line.startswith("-")]
+        self.assertGreaterEqual(len(bullet_lines), 3)
+        self.assertLessEqual(len(bullet_lines), 5)
+        self.assertTrue(any("大厂主战场型机会" in line for line in bullet_lines))
+
 
 if __name__ == "__main__":
     unittest.main()

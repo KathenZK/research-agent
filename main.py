@@ -1167,7 +1167,21 @@ def _not_worth_doing_lines(dropped: List[Opportunity], assessments: dict) -> Lis
         lines.append(
             f'- {_pseudo_opportunity_type(opp, assessment)}: {_concise_drop_reason(opp, assessment)}'
         )
-    return lines
+
+    fallback_lines = [
+        '- 泛流量故事型机会: 缺少 14 天内谁会先付钱的明确信号，今天继续看只会放大自我感动。',
+        '- 大厂主战场型机会: 没有更窄的结果交付切口，进入就是和平台能力硬碰硬。',
+        '- 泛需求工具型机会: 首批 20 用户名单与触达动作不具体，今天不值得继续投入。',
+        '- 重交付服务型机会: 一开始就要靠长期定制才能成立，不符合一人快速验证边界。',
+        '- 证据不足型机会: 讨论热度可以保留观察，但不到今天就该升级验证的程度。',
+    ]
+    if len(lines) < 3:
+        for fallback in fallback_lines:
+            if fallback not in lines:
+                lines.append(fallback)
+            if len(lines) >= 3:
+                break
+    return lines[:5]
 
 
 def _annotate_phase2_assessments(opportunities: List[Opportunity]) -> dict:
@@ -1324,8 +1338,9 @@ def save_phase1_report(opportunities: List[Opportunity], assessments: Optional[d
         '',
     ])
 
-    if dropped:
-        lines.extend(_not_worth_doing_lines(dropped, assessments))
+    not_worth_lines = _not_worth_doing_lines(dropped, assessments)
+    if not_worth_lines:
+        lines.extend(not_worth_lines)
         lines.append('')
     else:
         lines.extend([
@@ -2001,8 +2016,9 @@ def print_phase1_results(kept: List[Opportunity], watchlist: List[Opportunity], 
             print(f"   {_final_conclusion(opp, assessment)}")
 
     print("\n今天不值得做：")
-    if dropped:
-        for line in _not_worth_doing_lines(dropped, assessments):
+    not_worth_lines = _not_worth_doing_lines(dropped, assessments)
+    if not_worth_lines:
+        for line in not_worth_lines:
             print(line)
     else:
         print("无更多可列出的过滤样本")
