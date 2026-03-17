@@ -102,14 +102,18 @@ python3 main.py --help
 
 ## Feishu Doc 验证
 
-`sync_report_to_feishu()` 现在会优先尝试真实 Feishu DocX 写入，并在失败时输出明确 blocker，而不是只打印笼统的失败/跳过。
+`sync_report_to_feishu()` 会优先尝试真实 Feishu DocX 写入；若运行环境、凭据或网络不满足条件，会输出明确 blocker，而不是只打印笼统的失败/跳过。
 
-当前仓库已在本环境做过两次真实验证尝试：
+当前仓库已完成一次真实端到端验收：
 
-- 保留代理环境时，Feishu SDK 鉴权前失败，错误为 `EPERM 127.0.0.1:7897`，说明当前代理/沙箱不允许连到本地代理。
-- 去掉代理环境后，鉴权前失败，错误为 `ENOTFOUND open.feishu.cn`，说明当前环境没有可用的 Feishu 外网 DNS/网络访问。
+- 2026-03-17：成功创建并写入 Feishu Doc，返回真实 docx URL：`https://feishu.cn/docx/FDXqd8UfxodCBKx1vgoc44SMnBd`
 
-因此当前环境下无法完成真正的 Doc 创建与回写，但程序会显式输出这类 blocker：
+之前也验证过两类真实 blocker，代码仍会显式报告：
+
+- `EPERM 127.0.0.1:7897`：当前代理/沙箱不允许连到本地代理。
+- `ENOTFOUND open.feishu.cn`：当前环境没有可用的 Feishu 外网 DNS/网络访问。
+
+典型 blocker 输出示例：
 
 ```text
 Feishu doc sync blocked: node runtime not found; install Node.js or add node to PATH
