@@ -34,7 +34,6 @@ from collectors import (
     GitHubIssuesCollector, GitHubTrendingCollector, HNCollector, PHCollector,
     RedditPainCollector, SaaSReviewsCollector,
 )
-from collectors.indiehackers import IndieHackersCollector
 from collectors.reddit import RedditCollector
 from analyzers import BailianAnalyzer
 from models import Opportunity
@@ -76,7 +75,7 @@ def setup_logging():
 
 def collect_data(
     hn_limit=10, ph_limit=5, media_hours=48,
-    indie_limit=15, reddit_limit=10, github_limit=10,
+    reddit_limit=10, github_limit=10,
     enable_agent_reach=False, ar_limit=10,
     enable_app_store_reviews=True, app_store_review_limit=15,
     enable_github_pain_issues=True, github_pain_limit=15,
@@ -121,9 +120,6 @@ def collect_data(
 
     logger.info(f"Fetching Chinese Media (hours={media_hours})...")
     items.extend(ChineseMediaCollector.fetch(hours=media_hours, limit=20))
-
-    logger.info(f"Fetching IndieHackers (limit={indie_limit})...")
-    items.extend(IndieHackersCollector().fetch(limit=indie_limit))
 
     # --- Agent Reach bridge ---
     if enable_agent_reach:
@@ -181,6 +177,7 @@ async def analyze_items_async(items: List[dict], min_score: int = 60) -> List[Op
             opp.enrichment_competitor_count = enrichment.competitor_count
             opp.enrichment_pain_post_count = enrichment.pain_post_count
             opp.enrichment_summary = enrichment.enrichment_summary
+            opp.enrichment_page_content = enrichment.page_content
 
     logger.info(f"Found {len(opportunities)} opportunities")
     return opportunities
@@ -447,7 +444,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--ph-limit', type=int, default=20)
     parser.add_argument('--min-score', type=int, default=60)
     parser.add_argument('--media-hours', type=int, default=48)
-    parser.add_argument('--indie-limit', type=int, default=15)
     parser.add_argument('--reddit-limit', type=int, default=10)
     parser.add_argument('--github-limit', type=int, default=10)
     parser.add_argument('--enable-agent-reach', action='store_true')
@@ -459,7 +455,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--reddit-pain-limit', type=int, default=15)
     parser.add_argument('--disable-saas-reviews', action='store_true', help='禁用 SaaS 评论差评采集（默认开启）')
     parser.add_argument('--saas-review-limit', type=int, default=12)
-    parser.add_argument('--indie-mode', action='store_true')
+    parser.add_argument('--indie-mode', action='store_true', help='一人公司模式：痛点源翻倍、热度源减半、降低 keep 阈值、自动生成 Landing Page')
     parser.add_argument('--enable-github-issues', action='store_true')
     parser.add_argument('--enable-mvp-generation', action='store_true')
     return parser
@@ -503,11 +499,26 @@ def main():
         print("错误：请配置 BAILIAN_API_KEY")
         sys.exit(1)
 
+    # --indie-mode: pain sources get double quota, hype sources halved, lower keep threshold
+    if args.indie_mode:
+        logger.info("Indie mode active: boosting pain sources, reducing hype sources")
+        args.app_store_review_limit = max(args.app_store_review_limit, 20)
+        args.github_pain_limit = max(args.github_pain_limit, 20)
+        args.reddit_pain_limit = max(args.reddit_pain_limit, 20)
+        args.saas_review_limit = max(args.saas_review_limit, 16)
+        args.hn_limit = min(args.hn_limit, 15)
+        args.ph_limit = min(args.ph_limit, 10)
+        args.min_score = min(args.min_score, 55)
+        args.enable_mvp_generation = True
+        from screening import constants as sc
+        sc.PHASE2_KEEP_MIN_SCORE = 78
+        sc.PHASE2_WATCH_MIN_SCORE = 68
+
     if args.test:
         logger.info("Test mode: fetching sample data...")
         items = collect_data(
             hn_limit=5, ph_limit=3, media_hours=args.media_hours,
-            indie_limit=min(5, args.indie_limit), reddit_limit=min(4, args.reddit_limit),
+            reddit_limit=min(4, args.reddit_limit),
             github_limit=min(4, args.github_limit),
             enable_agent_reach=args.enable_agent_reach, ar_limit=min(5, args.ar_limit),
             enable_app_store_reviews=not args.disable_app_store_reviews,
@@ -526,7 +537,7 @@ def main():
     # --- Normal run ---
     items = collect_data(
         hn_limit=args.hn_limit, ph_limit=args.ph_limit, media_hours=args.media_hours,
-        indie_limit=args.indie_limit, reddit_limit=args.reddit_limit, github_limit=args.github_limit,
+        reddit_limit=args.reddit_limit, github_limit=args.github_limit,
         enable_agent_reach=args.enable_agent_reach, ar_limit=args.ar_limit,
         enable_app_store_reviews=not args.disable_app_store_reviews,
         app_store_review_limit=args.app_store_review_limit,

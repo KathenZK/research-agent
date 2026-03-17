@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Web enricher -- gathers lightweight market evidence for candidate opportunities."""
+"""Web enricher -- gathers market evidence and page content for candidate opportunities.
+
+Three enrichment axes:
+1. Competitor check via DuckDuckGo HTML search (real search results, not instant answers)
+2. Pain density check via Reddit search
+3. Page content extraction from the opportunity's source URL
+"""
 
 from __future__ import annotations
 
@@ -11,6 +17,17 @@ from urllib.parse import quote_plus
 
 import aiohttp
 
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None  # type: ignore[misc,assignment]
+
+_CONTENT_LIMIT = 2000
+_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
 
 @dataclass
 class EnrichmentResult:
@@ -21,6 +38,7 @@ class EnrichmentResult:
     pain_snippets: List[str] = field(default_factory=list)
     ph_existing_count: int = 0
     ph_product_names: List[str] = field(default_factory=list)
+    page_content: str = ""
     enrichment_summary: str = ""
 
     @property
@@ -40,6 +58,8 @@ class EnrichmentResult:
             score += 2
         elif self.ph_existing_count >= 3:
             score -= 1
+        if self.page_content:
+            score += 1
         return score
 
     def to_prompt_context(self) -> str:
@@ -52,27 +72,44 @@ class EnrichmentResult:
         parts.append(f"Product Hunt 已有类似产品: {self.ph_existing_count}")
         if self.ph_product_names:
             parts.append(f"已有产品: {', '.join(self.ph_product_names[:3])}")
+        if self.page_content:
+            parts.append(f"\n--- 原始页面正文（截取） ---\n{self.page_content[:_CONTENT_LIMIT]}\n--- 正文结束 ---")
         return '\n'.join(parts)
 
 
 class WebEnricher:
-    """Async web enricher that gathers market evidence via public APIs."""
+    """Async web enricher that gathers market evidence via public APIs and page scraping."""
 
     def __init__(self, timeout: int = 15):
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self._semaphore = asyncio.Semaphore(3)
 
-    async def enrich_async(self, title: str, keywords: Optional[List[str]] = None) -> EnrichmentResult:
+    async def enrich_async(
+        self,
+        title: str,
+        keywords: Optional[List[str]] = None,
+        url: Optional[str] = None,
+    ) -> EnrichmentResult:
         search_terms = self._extract_search_terms(title, keywords)
-        if not search_terms:
-            return EnrichmentResult()
         async with aiohttp.ClientSession(timeout=self.timeout) as session:
-            tasks = [
-                self._check_competitors(session, search_terms),
-                self._check_reddit_pain(session, search_terms),
-                self._check_producthunt(session, search_terms),
-            ]
+            tasks: list = []
+            if search_terms:
+                tasks.extend([
+                    self._check_competitors(session, search_terms),
+                    self._check_reddit_pain(session, search_terms),
+                    self._check_producthunt(session, search_terms),
+                ])
+            else:
+                tasks.extend([
+                    asyncio.coroutine(lambda: {'count': 0, 'names': []})(),  # type: ignore
+                ] * 3)
+            if url and url.startswith('http'):
+                tasks.append(self._fetch_page_content(session, url))
+            else:
+                tasks.append(self._empty_coro())
+
             results = await asyncio.gather(*tasks, return_exceptions=True)
+
         result = EnrichmentResult()
         if isinstance(results[0], dict):
             result.competitor_count = results[0].get('count', 0)
@@ -83,20 +120,33 @@ class WebEnricher:
         if isinstance(results[2], dict):
             result.ph_existing_count = results[2].get('count', 0)
             result.ph_product_names = results[2].get('names', [])
+        if isinstance(results[3], str) and results[3]:
+            result.page_content = results[3][:_CONTENT_LIMIT]
         result.enrichment_summary = result.to_prompt_context()
         return result
 
-    def enrich(self, title: str, keywords: Optional[List[str]] = None) -> EnrichmentResult:
-        return asyncio.run(self.enrich_async(title, keywords))
+    @staticmethod
+    async def _empty_coro():
+        return ""
 
-    async def batch_enrich_async(self, items: List[Dict[str, Any]], session: Optional[aiohttp.ClientSession] = None) -> Dict[str, EnrichmentResult]:
+    def enrich(self, title: str, keywords: Optional[List[str]] = None, url: Optional[str] = None) -> EnrichmentResult:
+        return asyncio.run(self.enrich_async(title, keywords, url))
+
+    async def batch_enrich_async(
+        self,
+        items: List[Dict[str, Any]],
+        session: Optional[aiohttp.ClientSession] = None,
+    ) -> Dict[str, EnrichmentResult]:
         results: Dict[str, EnrichmentResult] = {}
-        async def _one(item):
+
+        async def _one(item: Dict[str, Any]):
             async with self._semaphore:
                 item_id = str(item.get('id', ''))
                 title = item.get('title', '')
                 tags = item.get('tags', [])
-                return item_id, await self.enrich_async(title, tags)
+                url = item.get('url', '')
+                return item_id, await self.enrich_async(title, tags, url)
+
         own = session is None
         client = session or aiohttp.ClientSession(timeout=self.timeout)
         try:
@@ -122,25 +172,66 @@ class WebEnricher:
             meaningful.extend(kw for kw in keywords[:3] if kw.lower() not in stop)
         return ' '.join(meaningful[:8])
 
+    # ------------------------------------------------------------------
+    # Competitor check: DuckDuckGo HTML search (real results)
+    # ------------------------------------------------------------------
+
     async def _check_competitors(self, session: aiohttp.ClientSession, terms: str) -> Dict[str, Any]:
+        """Search DuckDuckGo HTML endpoint for real competitor results."""
         async with self._semaphore:
             try:
-                query = f"{terms} tool OR software OR app"
-                url = f"https://api.duckduckgo.com/?q={quote_plus(query)}&format=json&no_redirect=1"
-                async with session.get(url) as resp:
+                query = f"{terms} tool OR software OR app OR SaaS"
+                url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+                headers = {**_HEADERS, "Accept": "text/html"}
+                async with session.get(url, headers=headers) as resp:
                     if resp.status != 200:
-                        return {'count': 0, 'names': []}
-                    data = await resp.json(content_type=None)
-                names = []
-                for topic in (data.get('RelatedTopics', []))[:10]:
-                    text = topic.get('Text', '')
-                    if text:
-                        name = text.split(' - ')[0].strip()[:50]
-                        if name and len(name) > 2:
-                            names.append(name)
-                return {'count': len(names), 'names': names[:5]}
+                        return await self._check_competitors_fallback(session, terms)
+                    html = await resp.text()
+
+                names: List[str] = []
+                if BeautifulSoup:
+                    soup = BeautifulSoup(html, 'html.parser')
+                    for result in soup.select('.result__title, .result__a'):
+                        text = result.get_text(strip=True)
+                        if text and len(text) > 3 and len(text) < 80:
+                            clean = re.sub(r'\s+', ' ', text).strip()
+                            if clean and clean.lower() not in ('duckduckgo', 'privacy'):
+                                names.append(clean)
+                else:
+                    raw_titles = re.findall(r'class="result__a"[^>]*>([^<]+)<', html)
+                    for t in raw_titles:
+                        clean = re.sub(r'\s+', ' ', t).strip()
+                        if clean and len(clean) > 3 and len(clean) < 80:
+                            names.append(clean)
+
+                unique = list(dict.fromkeys(names))[:10]
+                return {'count': len(unique), 'names': unique[:5]}
             except Exception:
-                return {'count': 0, 'names': []}
+                return await self._check_competitors_fallback(session, terms)
+
+    async def _check_competitors_fallback(self, session: aiohttp.ClientSession, terms: str) -> Dict[str, Any]:
+        """Fallback to DuckDuckGo Instant Answers API."""
+        try:
+            query = f"{terms} tool OR software OR app"
+            url = f"https://api.duckduckgo.com/?q={quote_plus(query)}&format=json&no_redirect=1"
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    return {'count': 0, 'names': []}
+                data = await resp.json(content_type=None)
+            names = []
+            for topic in (data.get('RelatedTopics', []))[:10]:
+                text = topic.get('Text', '')
+                if text:
+                    name = text.split(' - ')[0].strip()[:50]
+                    if name and len(name) > 2:
+                        names.append(name)
+            return {'count': len(names), 'names': names[:5]}
+        except Exception:
+            return {'count': 0, 'names': []}
+
+    # ------------------------------------------------------------------
+    # Reddit pain check
+    # ------------------------------------------------------------------
 
     async def _check_reddit_pain(self, session: aiohttp.ClientSession, terms: str) -> Dict[str, Any]:
         async with self._semaphore:
@@ -163,6 +254,10 @@ class WebEnricher:
             except Exception:
                 return {'count': 0, 'snippets': []}
 
+    # ------------------------------------------------------------------
+    # Product Hunt check
+    # ------------------------------------------------------------------
+
     async def _check_producthunt(self, session: aiohttp.ClientSession, terms: str) -> Dict[str, Any]:
         async with self._semaphore:
             try:
@@ -182,3 +277,44 @@ class WebEnricher:
                 return {'count': len(names), 'names': names[:5]}
             except Exception:
                 return {'count': 0, 'names': []}
+
+    # ------------------------------------------------------------------
+    # Page content extraction (P0 fix: feed real content to LLM Call 2)
+    # ------------------------------------------------------------------
+
+    async def _fetch_page_content(self, session: aiohttp.ClientSession, url: str) -> str:
+        """Fetch and extract readable text from the opportunity's source URL."""
+        if not url or not url.startswith('http'):
+            return ""
+        skip_domains = ('github.com/trending', 'reddit.com/search', 'itunes.apple.com')
+        if any(d in url for d in skip_domains):
+            return ""
+        async with self._semaphore:
+            try:
+                async with session.get(url, headers=_HEADERS, allow_redirects=True) as resp:
+                    if resp.status != 200:
+                        return ""
+                    ctype = resp.headers.get('content-type', '')
+                    if 'text/html' not in ctype and 'application/xhtml' not in ctype:
+                        return ""
+                    html = await resp.text(errors='replace')
+
+                if BeautifulSoup:
+                    soup = BeautifulSoup(html, 'html.parser')
+                    for tag in soup(['script', 'style', 'nav', 'footer', 'header', 'aside', 'iframe', 'noscript']):
+                        tag.decompose()
+                    article = soup.find('article') or soup.find('main') or soup.find('body')
+                    if not article:
+                        return ""
+                    text = article.get_text(separator='\n', strip=True)
+                else:
+                    text = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
+                    text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
+                    text = re.sub(r'<[^>]+>', ' ', text)
+                    text = re.sub(r'\s+', ' ', text).strip()
+
+                lines = [line.strip() for line in text.splitlines() if line.strip()]
+                clean = '\n'.join(lines)
+                return clean[:_CONTENT_LIMIT] if clean else ""
+            except Exception:
+                return ""

@@ -540,9 +540,10 @@ def _build_phase2_assessment(opp: Opportunity) -> ScreeningAssessment:
         kill_reasons.append('现在更多是"有人会讨论/会注册"，不是"有人会在 14 天内掏钱催你交付"。')
     kill_reasons.extend(hard_filter_reasons[:2])
 
+    import screening.constants as _sc
     critical_red_flags = bool(heavy_delivery_hits) or (bool(crowded_hits) and bool(frontline_hits))
     if (
-        adjusted_score >= PHASE2_KEEP_MIN_SCORE
+        adjusted_score >= _sc.PHASE2_KEEP_MIN_SCORE
         and evidence_score >= 5
         and fast_payback
         and acquisition_level >= 2
@@ -553,7 +554,7 @@ def _build_phase2_assessment(opp: Opportunity) -> ScreeningAssessment:
     ):
         verdict = 'keep'
     elif (
-        adjusted_score >= PHASE2_WATCH_MIN_SCORE
+        adjusted_score >= _sc.PHASE2_WATCH_MIN_SCORE
         and evidence_score >= 4
         and acquisition_level >= 1
         and not generic_action_plan

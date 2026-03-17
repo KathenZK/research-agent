@@ -6,8 +6,6 @@ from unittest.mock import Mock, patch
 import main
 from collectors.appstore_reviews import AppStoreReviewsCollector
 from collectors.github_issues import GitHubIssuesCollector
-from collectors.reddit_pain import RedditPainCollector
-from collectors.saas_reviews import SaaSReviewsCollector
 
 
 class _FakeResponse:
@@ -104,7 +102,6 @@ class NewSourceCollectorTests(unittest.TestCase):
         with patch.object(main.HNCollector, "fetch", return_value=[]), \
              patch.object(main.PHCollector, "fetch", return_value=[]), \
              patch("main.ChineseMediaCollector.fetch", return_value=[]), \
-             patch("main.IndieHackersCollector.fetch", return_value=[]), \
              patch("main.GitHubTrendingCollector.fetch", return_value=[]), \
              patch("main.RedditCollector.fetch", return_value=[]), \
              patch("main.RedditPainCollector.fetch", return_value=[]), \
@@ -116,7 +113,7 @@ class NewSourceCollectorTests(unittest.TestCase):
                  {"id": "g1", "title": "issue pain", "source": "github_issues", "url": "https://example.com"}
              ]):
             items = main.collect_data(
-                hn_limit=0, ph_limit=0, media_hours=1, indie_limit=0,
+                hn_limit=0, ph_limit=0, media_hours=1,
                 reddit_limit=0, github_limit=0,
                 enable_app_store_reviews=True, app_store_review_limit=2,
                 enable_github_pain_issues=True, github_pain_limit=2,
