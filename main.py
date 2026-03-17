@@ -503,17 +503,6 @@ def main():
             print(f"Weekly report ready: {report_file}")
         return
 
-    try:
-        validate_config()
-    except ValueError as e:
-        print(f"配置错误：{e}")
-        sys.exit(1)
-
-    if not BAILIAN_API_KEY:
-        logger.error("BAILIAN_API_KEY not configured.")
-        print("错误：请配置 BAILIAN_API_KEY")
-        sys.exit(1)
-
     # --indie-mode: pain sources get double quota, hype sources halved, lower keep threshold
     if args.indie_mode:
         logger.info("Indie mode active: boosting pain sources, reducing hype sources")
@@ -554,6 +543,18 @@ def main():
         for item in items[:3]:
             print(f"  - {item['title']}")
         return
+
+    # --- Config validation (only needed for normal run with LLM) ---
+    try:
+        validate_config()
+    except ValueError as e:
+        print(f"配置错误：{e}")
+        sys.exit(1)
+
+    if not BAILIAN_API_KEY:
+        logger.error("BAILIAN_API_KEY not configured.")
+        print("错误：请配置 BAILIAN_API_KEY")
+        sys.exit(1)
 
     # --- Normal run ---
     items = collect_data(

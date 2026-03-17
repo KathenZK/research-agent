@@ -24,7 +24,7 @@ PAIN_QUERIES = [
     "SaaS 推荐",
 ]
 
-HOT_LIST_URL = "https://www.zhihu.com/api/v3/feed/topstory/hot-list"
+HOT_LIST_URL = "https://api.zhihu.com/topstory/hot-list"
 SEARCH_URL = "https://www.zhihu.com/api/v4/search_v3"
 
 _HEADERS = {
