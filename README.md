@@ -7,8 +7,10 @@
 ### 1. 安装依赖
 
 ```bash
-cd ~/.openclaw/workspace/agents/research
-pip3 install -r requirements.txt
+cd /path/to/research-agent
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
 ### 2. 配置 API Key

@@ -115,7 +115,7 @@ npm install  # or pip install -r requirements.txt
 npm run dev  # or python src/main.py
 
 # Run tests
-npm test  # or pytest
+npm test  # or python3 -m unittest discover -s tests -q
 ```
 
 ## 📁 Project Structure

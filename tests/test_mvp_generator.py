@@ -27,6 +27,8 @@ class MVPGeneratorTests(unittest.TestCase):
 
             self.assertIn('**机会信号**: 高', readme)
             self.assertIn('**验证动作**: 做 7 天 MVP 验证', readme)
+            self.assertIn('python3 -m unittest discover -s tests -q', readme)
+            self.assertNotIn('pytest', readme)
             self.assertNotIn('**Score**', readme)
             self.assertNotIn('/100', readme)
         finally:
