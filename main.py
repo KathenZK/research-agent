@@ -1872,11 +1872,14 @@ def create_github_issues(opportunities: List[Opportunity]):
     created = 0
     for opp in opportunities[:3]:  # 只创建 Top 3
         try:
+            signal_label = _signal_strength_label(getattr(opp, 'phase2_adjusted_score', None) or opp.score)
+            validation_action = getattr(opp, 'phase2_decision_label', '') or opp.decision_label()
             data = {
-                "title": f"🚀 {opp.title[:50]} - {opp.score}分机会",
+                "title": f"🚀 {opp.title[:50]} - {validation_action}",
                 "body": f"""## 📊 机会评估
 
-- **评分**: {opp.score}/100
+- **机会信号**: {signal_label}
+- **验证动作**: {validation_action}
 - **来源**: {opp.source.upper()}
 - **发现日期**: {opp.created_at.strftime('%Y-%m-%d')}
 
