@@ -192,12 +192,46 @@ def _looks_specific_deliverable(text: str) -> bool:
     return any(term in normalized for term in PHASE2_CONCRETE_DELIVERABLE_TERMS)
 
 
+def _raw_context_text(opp: Opportunity) -> str:
+    return ' '.join([
+        opp.title or '',
+        opp.source or '',
+        opp.url or '',
+        ' '.join(opp.tags or []),
+    ]).lower()
+
+
 def _extract_trigger_candidate(opp: Opportunity) -> str:
-    _, text_lower = _combined_signal_text(opp)
+    context_lower = _raw_context_text(opp)
     for keywords, trigger in PHASE2_TRIGGER_HINTS:
-        if any(keyword in text_lower for keyword in keywords):
+        if any(keyword in context_lower for keyword in keywords):
             return trigger
     return ''
+
+
+def _deliverable_matches_context(deliverable: str, opp: Opportunity) -> bool:
+    normalized = _clean_text(deliverable).lower()
+    if not normalized:
+        return False
+
+    context_lower = _raw_context_text(opp)
+    guard_terms = {
+        '一份工单分流与回复建议清单': ['support', 'ticket', '客服', '工单', 'helpdesk', 'reply'],
+        '一个单一框架迁移包': ['migration', 'migrate', 'framework', 'stack', 'upgrade', '迁移', '框架', '切换栈'],
+        '一份基于真实代码库的 AI 编程评审清单与 playbook': ['playbook', '代码库', '评审', 'code review', 'developer', '开发', 'engineering'],
+        '一份退款滥用审计报告': ['refund', 'chargeback', '退款', 'payment dispute'],
+        '一份 failed payment 与流失诊断报告': ['failed payment', 'payment', 'billing', 'subscription', '支付', '订阅', '流失'],
+    }
+
+    for canonical, keywords in guard_terms.items():
+        if normalized == canonical.lower():
+            return any(keyword in context_lower for keyword in keywords)
+
+    deliverable_tokens = [token for token in re.split(r'[^\w\u4e00-\u9fff]+', normalized) if len(token) >= 2]
+    if not deliverable_tokens:
+        return True
+    overlap = sum(1 for token in deliverable_tokens if token in context_lower)
+    return overlap >= 1
 
 
 def _extract_deliverable_candidate(opp: Opportunity) -> str:
@@ -212,12 +246,12 @@ def _extract_deliverable_candidate(opp: Opportunity) -> str:
     ]
     for text in haystacks:
         candidate = _extract_specific_phrase(text, patterns)
-        if candidate and _looks_specific_deliverable(candidate):
+        if candidate and _looks_specific_deliverable(candidate) and _deliverable_matches_context(candidate, opp):
             return candidate
 
-    _, text_lower = _combined_signal_text(opp)
+    context_lower = _raw_context_text(opp)
     for keywords, deliverable in PHASE2_DELIVERABLE_HINTS:
-        if any(keyword in text_lower for keyword in keywords):
+        if any(keyword in context_lower for keyword in keywords) and _deliverable_matches_context(deliverable, opp):
             return deliverable
     return ''
 
@@ -339,8 +373,10 @@ def _build_phase2_assessment(opp: Opportunity) -> ScreeningAssessment:
     target_user = _extract_target_user(opp, profile)
     trigger_candidate = _extract_trigger_candidate(opp)
     deliverable_candidate = _extract_deliverable_candidate(opp)
-    trigger_event = trigger_candidate or (profile['trigger'] if profile else '用户最着急解决这个问题时')
-    deliverable = deliverable_candidate or (profile['deliverable'] if profile else '一个单点可收费结果')
+    inferred_trigger = profile['trigger'] if profile else ''
+    inferred_deliverable = profile['deliverable'] if profile else ''
+    trigger_event = trigger_candidate or inferred_trigger or '用户最着急解决这个问题时'
+    deliverable = deliverable_candidate or (inferred_deliverable if _deliverable_matches_context(inferred_deliverable, opp) else '') or '一个单点可收费结果'
     avoid_label = profile['avoid_label'] if profile else f'一个泛化复制"{opp.title}"的产品'
     first_users_hint = profile['first_users_hint'] if profile else ''
 

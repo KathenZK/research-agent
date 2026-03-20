@@ -312,6 +312,32 @@ class Phase2ScreeningTests(unittest.TestCase):
         self.assertIn("首批 20 用户来源仍是 SEO / 社媒 / 泛 cold outreach", suggestion["suggestion"])
         self.assertIn("今天有 3 条样本", suggestion["evidence"])
 
+    def test_irrelevant_ticket_deliverable_does_not_leak_into_non_support_topics(self):
+        opp = Opportunity(
+            id="netcatty-1",
+            title="Netcatty - 开源免费的 SSH 终端软件, 使用 AI 加速你的日常运维工作",
+            source="v2ex",
+            url="https://www.v2ex.com/t/1199762",
+            score=80,
+            description="一个面向程序员和运维人员的 SSH 终端工具。",
+            summary="用户讨论 AI 加速运维和终端体验。",
+            startup_cost="$1-5k",
+            time_to_revenue="14天",
+            revenue_model="订阅",
+            monthly_potential="$10-50k",
+            automation_rate="80%",
+            customer_acquisition="V2EX 帖子评论区与运维社群外联",
+            risks="终端工具竞争激烈。",
+            action_plan="先联系帖子评论者，验证他们是否愿意为更好的 SSH 工作流付费。",
+            tags=["ssh", "terminal", "ops", "developer tool"],
+        )
+
+        assessment = _build_phase2_assessment(opp)
+        wedge = _wedge_statement(opp, assessment)
+
+        self.assertNotEqual(assessment.deliverable, "一份工单分流与回复建议清单")
+        self.assertNotIn("工单分流与回复建议清单", wedge)
+
 
 if __name__ == "__main__":
     unittest.main()
