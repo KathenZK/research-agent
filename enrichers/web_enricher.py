@@ -10,6 +10,7 @@ Three enrichment axes:
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -80,35 +81,46 @@ class EnrichmentResult:
 class WebEnricher:
     """Async web enricher that gathers market evidence via public APIs and page scraping."""
 
-    def __init__(self, timeout: int = 15):
+    def __init__(self, timeout: int = 15, per_item_timeout: Optional[int] = None, progress_every: int = 10):
         self.timeout = aiohttp.ClientTimeout(total=timeout)
+        self.per_item_timeout = per_item_timeout or max(timeout * 2, 30)
+        self.progress_every = max(1, progress_every)
         self._semaphore = asyncio.Semaphore(3)
+        self._logger = logging.getLogger(__name__)
 
     async def enrich_async(
         self,
         title: str,
         keywords: Optional[List[str]] = None,
         url: Optional[str] = None,
+        session: Optional[aiohttp.ClientSession] = None,
     ) -> EnrichmentResult:
         search_terms = self._extract_search_terms(title, keywords)
-        async with aiohttp.ClientSession(timeout=self.timeout) as session:
+        own_session = session is None
+        client = session or aiohttp.ClientSession(timeout=self.timeout)
+        try:
             tasks: list = []
             if search_terms:
                 tasks.extend([
-                    self._check_competitors(session, search_terms),
-                    self._check_reddit_pain(session, search_terms),
-                    self._check_producthunt(session, search_terms),
+                    self._check_competitors(client, search_terms),
+                    self._check_reddit_pain(client, search_terms),
+                    self._check_producthunt(client, search_terms),
                 ])
             else:
                 tasks.extend([
-                    asyncio.coroutine(lambda: {'count': 0, 'names': []})(),  # type: ignore
-                ] * 3)
+                    self._empty_json_result(),
+                    self._empty_json_result(),
+                    self._empty_json_result(),
+                ])
             if url and url.startswith('http'):
-                tasks.append(self._fetch_page_content(session, url))
+                tasks.append(self._fetch_page_content(client, url))
             else:
                 tasks.append(self._empty_coro())
 
             results = await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            if own_session:
+                await client.close()
 
         result = EnrichmentResult()
         if isinstance(results[0], dict):
@@ -129,6 +141,10 @@ class WebEnricher:
     async def _empty_coro():
         return ""
 
+    @staticmethod
+    async def _empty_json_result() -> Dict[str, Any]:
+        return {'count': 0, 'names': []}
+
     def enrich(self, title: str, keywords: Optional[List[str]] = None, url: Optional[str] = None) -> EnrichmentResult:
         return asyncio.run(self.enrich_async(title, keywords, url))
 
@@ -138,26 +154,62 @@ class WebEnricher:
         session: Optional[aiohttp.ClientSession] = None,
     ) -> Dict[str, EnrichmentResult]:
         results: Dict[str, EnrichmentResult] = {}
+        total = len(items)
+        completed = 0
+        failed = 0
 
         async def _one(item: Dict[str, Any]):
-            async with self._semaphore:
-                item_id = str(item.get('id', ''))
-                title = item.get('title', '')
-                tags = item.get('tags', [])
-                url = item.get('url', '')
-                return item_id, await self.enrich_async(title, tags, url)
+            item_id = str(item.get('id', ''))
+            title = item.get('title', '')
+            tags = item.get('tags', [])
+            url = item.get('url', '')
+            try:
+                enrichment = await asyncio.wait_for(
+                    self.enrich_async(title, tags, url, session=client),
+                    timeout=self.per_item_timeout,
+                )
+                return item_id, enrichment
+            except asyncio.TimeoutError:
+                self._logger.warning(
+                    "Enrichment timeout for item_id=%s title=%r after %ss",
+                    item_id,
+                    title[:120],
+                    self.per_item_timeout,
+                )
+                return item_id, EnrichmentResult()
+            except Exception as exc:
+                self._logger.warning(
+                    "Enrichment failed for item_id=%s title=%r: %s",
+                    item_id,
+                    title[:120],
+                    exc,
+                )
+                return item_id, EnrichmentResult()
 
         own = session is None
         client = session or aiohttp.ClientSession(timeout=self.timeout)
+        tasks: List[asyncio.Task] = []
         try:
             tasks = [asyncio.create_task(_one(item)) for item in items]
             for task in asyncio.as_completed(tasks):
-                try:
-                    item_id, enrichment = await task
-                    results[item_id] = enrichment
-                except Exception:
-                    continue
+                item_id, enrichment = await task
+                results[item_id] = enrichment
+                completed += 1
+                if not enrichment.page_content and enrichment.competitor_count == 0 and enrichment.pain_post_count == 0 and enrichment.ph_existing_count == 0:
+                    failed += 1
+                if completed == 1 or completed % self.progress_every == 0 or completed == total:
+                    self._logger.info(
+                        "Enrichment progress: %s/%s completed (%s empty fallbacks)",
+                        completed,
+                        total,
+                        failed,
+                    )
         finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
             if own:
                 await client.close()
         return results
